@@ -7,16 +7,24 @@ the task code and the training stack are UW Lab's work. This section summarizes 
 
 **Status:** A state-based policy trained with OmniReset is now running on the physical UR5e. A hardware rollout demonstrated cube stacking with autonomous recovery after a dropped cube.
 
-### Real-robot policy rollout
+## Real-robot policy rollout
 
-[Watch the hardware demo](docs/thunder/media/real_robot_policy_stack.mp4)
+<p align="center">
+  <a href="docs/thunder/media/real_robot_policy_stack.mp4">
+    <img src="docs/thunder/media/real_robot_policy_stack.gif" alt="UR5e policy recovering a dropped cube and stacking it" width="320">
+  </a>
+  <br>
+  <a href="docs/thunder/media/real_robot_policy_stack.mp4">Video with sound</a>
+</p>
+
+## System identification and simulation
 
 | Real robot: system-identification run | Simulation: trained policy, real time |
 | --- | --- |
 | ![Thunder UR5e running the excitation trajectory](docs/thunder/media/real_robot_sysid_chirp.gif) | ![Simulated Thunder stacking a cube](docs/thunder/media/sim_reaching_episode.gif) |
 | [Video with sound](docs/thunder/media/real_robot_sysid_chirp.mp4) | [All nine recorded episodes](docs/thunder/media/sim_policy_rollouts.mp4) |
 
-### 1. Real-robot system identification
+### System identification
 
 - **Excitation:** UW Lab's 8 s Cartesian chirp (0.1 to 3 Hz), remapped to Thunder's sideways mount and started from a pose
   chosen for clearance. The arm runs the same Cartesian impedance gains used on hardware (Kp 1000 / 50).
@@ -31,7 +39,7 @@ the task code and the training stack are UW Lab's work. This section summarizes 
 
 ![Real vs simulated joint angles](docs/thunder/media/sysid_real_vs_sim.png)
 
-### 2. Training in simulation with the identified model
+### Policy training with the identified model
 
 - PPO (RSL-RL) from scratch with the hardware controller gains and the identified joint model in the loop (the 10 ms delay
   becomes one 8.3 ms physics step at 120 Hz). Upstream trains with softer gains first and fine-tunes toward the hardware; this
@@ -44,7 +52,7 @@ the task code and the training stack are UW Lab's work. This section summarizes 
 
 ![Training success by reset family](docs/thunder/media/training_success_curve.png)
 
-### 3. Problems found and fixed along the way
+## Engineering challenges
 
 - **Action axes on a sideways mount.** Policy actions are expressed in the robot base frame, so on Thunder the large
   rotation-action scale landed on a horizontal tilt instead of the vertical axis. Moving it to the correct axis fixed the mismatch.
@@ -60,7 +68,7 @@ the task code and the training stack are UW Lab's work. This section summarizes 
   under training randomization. The official Robotiq drive's actual squeeze varies sharply with the randomized gains, and the
   stronger squeezes eject cubes that the UMI fingers hold at an angle across their corners.
 
-### 4. Next steps
+## Next steps
 
 - Evaluate repeated physical rollouts across varied starting states and document hardware success rates and failure modes.
 - Train with the UMI fingertips once the gripper contact model is fixed.
