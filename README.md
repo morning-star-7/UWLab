@@ -5,7 +5,11 @@ to **Thunder**, a sideways-mounted UR5e with a Robotiq 2F-85 gripper and a RealS
 [RPM Lab](https://rpm-lab.github.io/), University of Minnesota. OmniReset (reinforcement learning from diverse reset states),
 the task code and the training stack are UW Lab's work. This section summarizes my adaptation to our robot and where it stands.
 
-**Status:** policies are trained in simulation; deploying them on the real robot is in progress.
+**Status:** A state-based policy trained with OmniReset is now running on the physical UR5e. A hardware rollout demonstrated cube stacking with autonomous recovery after a dropped cube.
+
+### Real-robot policy rollout
+
+[Watch the hardware demo](docs/thunder/media/real_robot_policy_stack.mp4)
 
 | Real robot: system-identification run | Simulation: trained policy, real time |
 | --- | --- |
@@ -58,7 +62,7 @@ the task code and the training stack are UW Lab's work. This section summarizes 
 
 ### 4. Next steps
 
-- Deploy the trained policy on Thunder.
+- Evaluate repeated physical rollouts across varied starting states and document hardware success rates and failure modes.
 - Train with the UMI fingertips once the gripper contact model is fixed.
 - Extend to the whole reachable table region with 60 mm cubes (the reachability map is built).
 
@@ -122,3 +126,4 @@ See [all available environments](https://uw-lab.github.io/UWLab/main/source/over
 
 UW Lab is released under [BSD-3 License](LICENSE)
 The Isaac Lab framework is released under [BSD-3 License](LICENSE).
+
