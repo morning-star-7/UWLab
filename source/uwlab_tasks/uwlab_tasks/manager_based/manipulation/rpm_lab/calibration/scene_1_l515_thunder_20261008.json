@@ -1,0 +1,44 @@
+{
+ "T_base_camera": [
+  [
+   0.02635726827090057,
+   -0.9174593572635718,
+   0.39695544104950836,
+   0.15820745311735257
+  ],
+  [
+   0.059809976662077435,
+   0.39782933140083165,
+   0.9155078316261687,
+   -0.12233843579113685
+  ],
+  [
+   -0.9978617444821589,
+   -0.0003883898572256128,
+   0.06535891716010345,
+   -0.2671378193185404
+  ],
+  [
+   0.0,
+   0.0,
+   0.0,
+   1.0
+  ]
+ ],
+ "frame": "ur_base",
+ "camera": "L515 f1380660 color optical frame (x right, y down, z forward)",
+ "convention": "p_base = T_base_camera @ p_camera, meters",
+ "source": "/home/srinivas/Desktop/spark-workspace/spark-data-collection/data_pipeline/configs/calibration.thunder_20261008.local.json",
+ "calibration_timestamp": "2026-10-08T18:15:24.221495",
+ "method": "Spark calibrate_rig.py: Thunder wrist D405 hand-eye (Tsai, 15 poses, UR getActualTCPPose with flange TCP) -> L515 from shared ChArUco views (DICT_5X5_50 6x9 30/22 mm)",
+ "quality": {
+  "l515_pose_spread_translation_std_m": [
+   0.004612869837744116,
+   0.0035551994874145946,
+   0.003942360057298825
+  ],
+  "l515_pose_spread_rotation_mean_deg": 0.5359569007445756,
+  "reprojection_error_mean_px": 0.1443431118906861
+ },
+ "usage": "run_state_policy.py --camera-transform <this file> --camera-transform-frame ur_base"
+}

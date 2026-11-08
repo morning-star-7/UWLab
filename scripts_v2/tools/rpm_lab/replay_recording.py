@@ -602,6 +602,14 @@ def sim_image(scene, name: str) -> np.ndarray:
     return scene[name].data.output["rgb"][0, ..., :3].cpu().numpy().astype(np.uint8)
 
 
+def undistort_l515(img: np.ndarray) -> np.ndarray:
+    """Remove the scene_1 L515's lens distortion so the frame matches the pinhole sim camera."""
+    import cv2
+
+    k = np.array(lab.L515_COLOR_INTRINSICS, dtype=np.float64).reshape(3, 3)
+    return cv2.undistort(np.ascontiguousarray(img), k, np.array(lab.L515_COLOR_DISTORTION))
+
+
 def compose_frame(scene, rec: Recording, t: float) -> np.ndarray:
     blank = np.zeros((lab.D405_HEIGHT, lab.D405_WIDTH, 3), dtype=np.uint8)
     panels = []
@@ -614,9 +622,11 @@ def compose_frame(scene, rec: Recording, t: float) -> np.ndarray:
     if "scene_1" in rec.images:
         real_scene = rec.image("scene_1", t)
         panels.append(
-            label(blank.copy() if real_scene is None else real_scene.copy(), "real scene_1 (L515, pose not calibrated)")
+            label(blank.copy() if real_scene is None else undistort_l515(real_scene), "real scene_1 L515 (undistorted)")
         )
-    panels.append(label(sim_image(scene, "overview"), f"sim  t={t:.1f}s"))
+        panels.append(label(sim_image(scene, "scene_camera"), f"sim scene_1 L515 (calibrated pose)  t={t:.1f}s"))
+    else:
+        panels.append(label(sim_image(scene, "overview"), f"sim  t={t:.1f}s"))
     if len(panels) % 2:
         panels.append(blank)
     rows = [np.concatenate(panels[i : i + 2], axis=1) for i in range(0, len(panels), 2)]
@@ -624,12 +634,14 @@ def compose_frame(scene, rec: Recording, t: float) -> np.ndarray:
 
 
 def save_stills(sim, scene, rec: Recording, arms: dict):
-    """Real wrist frames next to the sim wrist camera at the same recorded joints and gripper (kinematic)."""
+    """Real camera frames next to the sim camera at the same recorded joints and gripper (kinematic): each arm's wrist
+    D405 and the scene_1 L515 (real frame undistorted)."""
     from PIL import Image
 
     os.makedirs(args.stills, exist_ok=True)
-    for name, arm in arms.items():
-        key = f"{name}_wrist"
+    streams = {f"{name}_wrist": f"{name}_wrist_camera" for name in arms}
+    streams["scene_1"] = "scene_camera"
+    for key, sim_camera in streams.items():
         if key not in rec.images:
             continue
         times = rec.images[key][0]
@@ -647,12 +659,16 @@ def save_stills(sim, scene, rec: Recording, arms: dict):
             for _ in range(12):
                 sim.render()
             scene.update(sim.get_physics_dt())
-            real, simulated = rec.image(key, t), sim_image(scene, f"{name}_wrist_camera")
+            real = rec.image(key, t)
+            if key == "scene_1":
+                real = undistort_l515(real)
+            simulated = sim_image(scene, sim_camera)
             blend = (0.5 * real.astype(np.float32) + 0.5 * simulated.astype(np.float32)).astype(np.uint8)
             row = np.concatenate(
-                [label(real.copy(), f"real t={t:.2f}s"), label(simulated, "sim"), label(blend, "50/50 overlay")], 1
+                [label(real.copy(), f"real {key} t={t:.2f}s"), label(simulated, "sim"), label(blend, "50/50 overlay")],
+                1,
             )
-            path = os.path.join(args.stills, f"{name}_wrist_{t:06.2f}.png")
+            path = os.path.join(args.stills, f"{key}_{t:06.2f}.png")
             Image.fromarray(row).save(path)
             print(f"Saved {path}")
 
@@ -669,6 +685,7 @@ def main():
     if cameras:
         scene_cfg.thunder_wrist_camera.update_period = 0.0
         scene_cfg.lightning_wrist_camera.update_period = 0.0
+        scene_cfg.scene_camera.update_period = 0.0
         scene_cfg.overview = CameraCfg(
             prim_path="{ENV_REGEX_NS}/OverviewCamera",
             update_period=0.0,

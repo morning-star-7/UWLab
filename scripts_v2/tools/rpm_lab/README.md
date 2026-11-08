@@ -1,7 +1,7 @@
 # RPM Lab digital twin tools
 
 Scene: `source/uwlab_tasks/uwlab_tasks/manager_based/manipulation/rpm_lab/scene_cfg.py` (Thunder and Lightning on the
-Vention workcell; `RpmLabDualArmCameraSceneCfg` adds both wrist D405s). Assets live in `/data/cui00191/rpm_lab_assets`,
+Vention workcell; `RpmLabDualArmCameraSceneCfg` adds both wrist D405s and the calibrated scene_1 L515). Assets live in `/data/cui00191/rpm_lab_assets`,
 real recordings copied from the lab robot PC (Zeus) in `/data/cui00191/rpm_lab_recordings`.
 
 | Tool | Runs in | What it does |
@@ -60,6 +60,13 @@ the fixed link-to-camera transform (`D405_OPTICAL_FRAME` + `D405_IMAGER_OFFSET`)
   only during fast motion, where the robot PC reads joints and pose in separate RTDE calls).
 - Wrist D405: finger silhouettes in the real wrist images fix the camera at the left imager (`D405_IMAGER_OFFSET`).
 - Motion: driving the sim with the teleop commands through the fitted servoJ model reproduces the measured joints.
+- Scene camera `scene_1` (L515): pose from the lab's 2026-10-08 ChArUco calibration in Thunder's Base frame, saved
+  verbatim in `rpm_lab/calibration/scene_1_l515_thunder_20261008.json` (override with `RPM_SCENE_1_CALIBRATION`). Checked on the 10/28 Lightning episode: Lightning's recorded flange/grasp point
+  projects onto the real gripper in every frame, the sim render overlays the real arm (stills in
+  `replays/ep1028_185259_scene_stills`), and the tabletop plane in the L515 depth puts the camera 0.738 m above the
+  cloth at 22.6 deg (calibration: 0.746 m above the bare top, 23.6 deg). So the camera had not moved and Lightning's
+  placement relative to Thunder holds to the pixel level. Real frames have lens distortion: `cv2.undistort` them with
+  `L515_COLOR_DISTORTION` before comparing with or mixing into the pinhole sim renders.
 
 ## Known gaps
 
@@ -68,5 +75,7 @@ the fixed link-to-camera transform (`D405_OPTICAL_FRAME` + `D405_IMAGER_OFFSET`)
   marked table points, record `getActualTCPPose`). The real table also has a cloth, which the sim lacks.
 - Wrist depth: back-projected real D405 depth disagrees with the sim geometry in a range-dependent way (apparent 14 deg
   table tilt) while the color images agree; unresolved, so depth is not used for calibration yet.
-- Scene cameras (L515 `scene_1`): intrinsics known, pose never calibrated.
+- Omniverse cameras ignore the principal point (cx, cy forced to the image center; fx, fy averaged): sim frames are
+  shifted against real ones by up to 7.6 px (L515) / 4.5 px (D405). Warp sim renders to the real camera model
+  (K + distortion) with `cv2.remap` when building co-training data.
 - Thunder's D405 intrinsics were never recorded (Lightning's are used); joint friction/armature are reference values.

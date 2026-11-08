@@ -38,6 +38,7 @@ Set ``RPM_LAB_USD``, ``RPM_THUNDER_USD`` and ``RPM_LIGHTNING_USD`` to use other 
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 
@@ -365,9 +366,94 @@ def d405_wrist_camera_cfg(
     )
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Scene camera (scene_1, RealSense L515)
+# ---------------------------------------------------------------------------------------------------------------------
+
+L515_WIDTH, L515_HEIGHT = 640, 480
+L515_COLOR_INTRINSICS = (597.0170288085938, 0.0, 327.60223388671875, 0.0, 597.042724609375, 240.29771423339844, 0, 0, 1)
+"""Factory color intrinsics (row-major K, 640 x 480) of the scene_1 L515 (serial f1380660), from the episode manifests."""
+
+L515_COLOR_DISTORTION = (
+    0.13949772715568542,
+    -0.4636940360069275,
+    -0.0003899063740391284,
+    -0.00045536953257396817,
+    0.4163708984851837,
+)
+"""Its Brown-Conrady coefficients (OpenCV order k1, k2, p1, p2, k3). The sim camera is an ideal pinhole: undistort real
+frames (``cv2.undistort``) before comparing or mixing them with sim renders."""
+
+SCENE_1_CALIBRATION_FILE = os.environ.get(
+    "RPM_SCENE_1_CALIBRATION",
+    os.path.join(os.path.dirname(__file__), "calibration", "scene_1_l515_thunder_20261008.json"),
+)
+"""The lab's calibration of the scene_1 L515, saved verbatim from its calibration run.
+
+Spark ``calibrate_rig.py`` on 2026-10-08 (``calibration.thunder_20261008.local.json``): Thunder wrist D405 hand-eye
+(Tsai, 15 poses, flange TCP), then the L515 from shared ChArUco views (DICT_5X5_50 6x9, 30/22 mm). Pose spread over the
+views: 4-5 mm, 0.54 deg; reprojection error 0.14 px. Valid while the camera stays where it was on that day (checked on
+the 2026-10-28 Lightning recordings). Point ``RPM_SCENE_1_CALIBRATION`` at a newer file after the camera moves."""
+
+
+def _load_scene_1_calibration(path: str) -> tuple[tuple[float, ...], ...]:
+    with open(path) as f:
+        calibration = json.load(f)
+    if (
+        calibration.get("frame") != "ur_base"
+        or "optical frame (x right, y down, z forward)" not in calibration["camera"]
+    ):
+        raise ValueError(f"{path}: expected an L515 color optical frame in Thunder's ur_base frame")
+    return tuple(tuple(float(v) for v in row) for row in calibration["T_base_camera"])
+
+
+SCENE_1_T_THUNDER_BASE_CAMERA = _load_scene_1_calibration(SCENE_1_CALIBRATION_FILE)
+"""Pose of the scene_1 L515 color optical frame (ROS axes: x right, y down, z forward) in Thunder's controller Base
+frame (``ur_base``; = base_link turned 180 deg about z): ``p_base = T @ p_camera``, meters."""
+
+
+def _matmul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(len(b))) for j in range(len(b[0]))] for i in range(len(a))]
+
+
+def scene_camera_pose() -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """World (env-local) pose of the scene_1 optical frame, ROS axes: (position, w-x-y-z quaternion)."""
+    r = _quat_to_matrix(THUNDER_ROT)
+    base_link = [[*r[i], THUNDER_POS[i]] for i in range(3)] + [[0.0, 0.0, 0.0, 1.0]]
+    rz180 = [[-1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    t = _matmul(_matmul(base_link, rz180), [list(row) for row in SCENE_1_T_THUNDER_BASE_CAMERA])
+    return (t[0][3], t[1][3], t[2][3]), _matrix_to_quat([row[:3] for row in t[:3]])
+
+
+SCENE_CAMERA_POS, SCENE_CAMERA_ROT = scene_camera_pose()
+"""About (-0.09, 0.22, 1.59): between the columns, 0.75 m above the tabletop, looking down toward the front edge."""
+
+
+def l515_scene_camera_cfg(
+    data_types: tuple[str, ...] = ("rgb", "distance_to_image_plane"), update_period: float = 1.0 / 30.0
+) -> CameraCfg:
+    """The scene_1 L515 at its calibrated pose (30 Hz, 640 x 480 as recorded)."""
+    return CameraCfg(
+        prim_path="{ENV_REGEX_NS}/Scene1Camera",
+        update_period=update_period,
+        width=L515_WIDTH,
+        height=L515_HEIGHT,
+        data_types=list(data_types),
+        spawn=sim_utils.PinholeCameraCfg.from_intrinsic_matrix(
+            intrinsic_matrix=list(L515_COLOR_INTRINSICS),
+            width=L515_WIDTH,
+            height=L515_HEIGHT,
+            clipping_range=(0.05, 10.0),
+        ),
+        offset=CameraCfg.OffsetCfg(pos=SCENE_CAMERA_POS, rot=SCENE_CAMERA_ROT, convention="ros"),
+    )
+
+
 @configclass
 class RpmLabDualArmCameraSceneCfg(RpmLabDualArmSceneCfg):
-    """The workcell with both wrist D405s (color stream, with depth aligned to it). Needs ``--enable_cameras``."""
+    """The workcell with both wrist D405s (color stream, with depth aligned to it) and the scene_1 L515. Needs
+    ``--enable_cameras``."""
 
     thunder_wrist_camera: CameraCfg = d405_wrist_camera_cfg("Thunder")
     lightning_wrist_camera: CameraCfg = d405_wrist_camera_cfg("Lightning")
+    scene_camera: CameraCfg = l515_scene_camera_cfg()
