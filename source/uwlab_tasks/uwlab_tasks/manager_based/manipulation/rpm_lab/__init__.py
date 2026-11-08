@@ -4,3 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Digital twin of the RPM Lab Vention workcell with the Thunder and Lightning UR5e arms."""
+
+from .registry import register
+
+register()
