@@ -26,7 +26,9 @@ sys.stdout.reconfigure(line_buffering=True)
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--hold_steps", type=int, default=240, help="Physics steps used to check that both arms stay put.")
-parser.add_argument("--save_images", type=str, default=None, help="Directory for the rendered views.")
+parser.add_argument(
+    "--save_images", type=str, default=None, help="Directory for the rendered views and wrist-camera images."
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 if args.save_images:
@@ -288,6 +290,11 @@ def save_views(sim, scene, directory: str):
         path = os.path.join(directory, f"rpm_lab_{name}.png")
         Image.fromarray(rgb).save(path)
         print(f"Saved {path}")
+    for arm in ("thunder", "lightning"):  # the wrist D405s at the home postures
+        rgb = scene[f"{arm}_wrist_camera"].data.output["rgb"][0, ..., :3].cpu().numpy()
+        path = os.path.join(directory, f"rpm_lab_{arm}_wrist.png")
+        Image.fromarray(rgb).save(path)
+        print(f"Saved {path}")
 
 
 def main():
@@ -296,7 +303,8 @@ def main():
             raise FileNotFoundError(path)
     sim = sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=1.0 / 120.0, device=args.device))
     sim.set_camera_view((X + 2.3, -2.1, 2.3), (X, 0.1, 1.1))
-    scene_cfg = lab.RpmLabDualArmSceneCfg(num_envs=1, env_spacing=4.0)
+    scene_cfg_class = lab.RpmLabDualArmCameraSceneCfg if args.save_images else lab.RpmLabDualArmSceneCfg
+    scene_cfg = scene_cfg_class(num_envs=1, env_spacing=4.0)
     if args.save_images:
         scene_cfg.camera = CameraCfg(
             prim_path="{ENV_REGEX_NS}/ViewCamera",
@@ -327,5 +335,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
-    simulation_app.close()
+    try:
+        main()
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()  # close() ends the process with os._exit, which would drop the traceback
+        raise
+    finally:
+        # Also on errors: an exception that skips close() leaves the Kit app running and the process hangs.
+        simulation_app.close()

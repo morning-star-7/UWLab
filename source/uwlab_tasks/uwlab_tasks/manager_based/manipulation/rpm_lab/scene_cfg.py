@@ -24,8 +24,9 @@ report flange poses in their base frames. Placed with these mounts, the recorded
 0.06-0.35 m above the tabletop for both arms (11/2026 dual-arm session and 561 Lightning episodes from 05-09/2026). With
 the CAD orientation they would float 1.0-1.4 m above it.
 
-Asset paths default to the shared copies under ``/data``. Set ``RPM_LAB_USD``, ``RPM_THUNDER_USD`` and
-``RPM_LIGHTNING_USD`` to use other copies.
+Assets live under ``/data/cui00191/rpm_lab_assets``: ``sources/`` holds verbatim copies of the reviewed builds
+(sha256 below; originals by kanth042 under ``/data/kanth042``), and the two robot files are override layers on them.
+Set ``RPM_LAB_USD``, ``RPM_THUNDER_USD`` and ``RPM_LIGHTNING_USD`` to use other copies.
 
 .. warning::
     ``init_state.rot`` is the world orientation of ``base_link`` *after the root pose is written*, as every
@@ -43,6 +44,7 @@ import os
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import CameraCfg
 from isaaclab.utils import configclass
 
 from uwlab_assets.robots.ur5e_robotiq_gripper import IMPLICIT_UR5E_ROBOTIQ_2F85
@@ -51,30 +53,33 @@ from uwlab_assets.robots.ur5e_robotiq_gripper import IMPLICIT_UR5E_ROBOTIQ_2F85
 # Assets
 # ---------------------------------------------------------------------------------------------------------------------
 
-LAB_USD = os.environ.get("RPM_LAB_USD", "/data/kanth042/converted_assets/lab_vention_asset_v60/lab_vention.usd")
-"""Lab CAD: table, two columns and their mounting plates (millimeter units)."""
+ASSET_ROOT = "/data/cui00191/rpm_lab_assets"
 
-THUNDER_USD = os.environ.get(
-    "RPM_THUNDER_USD", "/data/cui00191/rpm_lab_assets/thunder_189_official_umi_fingertips/robot/robot.usda"
-)
+LAB_USD = os.environ.get("RPM_LAB_USD", f"{ASSET_ROOT}/sources/lab_vention_asset_v60/lab_vention.usd")
+"""Lab CAD: table, two columns and their mounting plates (millimeter units). Copy of
+``/data/kanth042/converted_assets/lab_vention_asset_v60/lab_vention.usd`` (sha256 28e14f38...)."""
+
+THUNDER_USD = os.environ.get("RPM_THUNDER_USD", f"{ASSET_ROOT}/thunder_189_official_umi_fingertips/robot/robot.usda")
 """Thunder: UR5e with Thunder's factory kinematic calibration, official Robotiq 2F-85 model with the rigid UMI
 fingertips, D405 mount.
 
 A small override layer on the reviewed build behind the R214 policy that runs on the real Thunder
-(``189_official_umi_fingertips_20261003/assets_visualfix/robot/robot.usd``, sha256 d6372619...). The layer changes only
+(``189_official_umi_fingertips_20261003/assets_visualfix/robot/robot.usd``, sha256 d6372619..., copied to
+``sources/189_official_umi_fingertips_20261003_visualfix``). The layer changes only
 the arm joint limits to the real UR5e's (+-360 deg, elbow +-180 deg). The source build limits the wrists to +-180 deg,
 and the real Thunder goes beyond that (wrist_3 at -5.1 rad in the 11/2026 recordings). Rebuild it with
 ``scripts_v2/tools/rpm_lab/build_calibrated_ur5e_usd.py``.
 """
 
 LIGHTNING_USD = os.environ.get(
-    "RPM_LIGHTNING_USD", "/data/cui00191/rpm_lab_assets/lightning_124_official_robotiq_d405/robot/robot.usda"
+    "RPM_LIGHTNING_USD", f"{ASSET_ROOT}/lightning_124_official_robotiq_d405/robot/robot.usda"
 )
 """Lightning: the official Robotiq 2F-85 model with the stock finger pads, D405 mount, and Lightning's own calibration.
 
 Lightning keeps its original fingers, and its D405 wrist camera mount is the same part as Thunder's. The file is a small
 override layer on the stock-pad build ``124_official_robotiq_d405_20260926/assets_visualfix/robot/robot.usd`` (sha256
-31b9852c...; R209: the same D405/adapter visual-placement fix as Thunder's R189 ``assets_visualfix``, physics unchanged).
+31b9852c..., copied to ``sources/124_official_robotiq_d405_20260926_visualfix``; R209: the same D405/adapter
+visual-placement fix as Thunder's R189 ``assets_visualfix``, physics unchanged).
 Relative to wrist_3_link, its whole hand (D405 mount, camera, optical frame, flange adapter, gripper) matches Thunder's
 exactly except the fingertips. It carries Thunder's calibration. The layer replaces the arm joint
 frames with Lightning's factory calibration (``calib_16320005684383956165``; 0.40 mm / 0.05 deg at the flange) and sets
@@ -90,7 +95,10 @@ TABLE_POS = (1.793445, 0.340075, -0.030851)
 TABLE_ROT = (0.5, 0.5, 0.5, 0.5)  # (w, x, y, z): CAD +Y (vertical) -> world +z, CAD +X -> world +y, CAD +Z -> world +x
 TABLE_SCALE = (0.001, 0.001, 0.001)
 TABLE_TOP_Z = 0.84235
-"""Height of the tabletop surface. The tabletop spans x in [-0.83484, 0.65016] and y in [-0.43230, 0.28770]."""
+"""Height of the tabletop surface (the bare CAD top; the real table carries a cloth)."""
+TABLE_X_RANGE = (-0.83484, 0.65016)
+TABLE_Y_RANGE = (-0.43230, 0.28770)
+"""World extent of the tabletop."""
 
 MIRROR_PLANE_X = -0.09234
 """The lab's symmetry plane, x = const.
@@ -285,3 +293,81 @@ class RpmLabDualArmSceneCfg(InteractiveSceneCfg):
         prim_path="/World/DomeLight",
         spawn=sim_utils.DomeLightCfg(intensity=1500.0, color=(0.95, 0.95, 0.95)),
     )
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Wrist cameras
+# ---------------------------------------------------------------------------------------------------------------------
+
+D405_WIDTH, D405_HEIGHT = 640, 480
+D405_COLOR_INTRINSICS = (
+    431.40667724609375,
+    0.0,
+    315.4774169921875,
+    0.0,
+    430.9008483886719,
+    238.31890869140625,
+    0,
+    0,
+    1,
+)
+"""Factory color intrinsics (row-major K, 640 x 480) of Lightning's wrist D405, from the robot PC's episode manifests.
+
+Distortion (inverse Brown-Conrady, k1 -0.055, k2 0.056) is not modeled. Thunder's D405 intrinsics were never recorded;
+its camera uses these as well (same model, units differ by a few pixels)."""
+
+D405_DEPTH_INTRINSICS = (
+    382.21246337890625,
+    0.0,
+    311.8672790527344,
+    0.0,
+    382.21246337890625,
+    239.64002990722656,
+    0,
+    0,
+    1,
+)
+"""Factory depth-stream intrinsics of the same D405 (the recorded ``depth/image_rect_raw`` is not aligned to color)."""
+
+D405_OPTICAL_FRAME = "OfficialHand/robotiq_base_link/d405_r2_nominal_optical_frame"
+"""The D405 optical frame in both robot models (USD camera convention: looks along -z, +y up), relative to the robot
+prim: the mount's nominal CAD placement, 30 deg pitch from the gripper axis, 9 mm right of the camera body's center."""
+
+D405_IMAGER_OFFSET = (-0.018, 0.0, 0.0)
+"""Correction from the model's optical frame to the real D405 color/depth origin, in that frame (m).
+
+The D405 streams from its left imager, 9 mm left of the body center; the model's frame sits 9 mm right of it. Fitted
+on Lightning's recorded wrist images (episode-20261028-185259, 10 frames) by matching the finger silhouettes, which are
+rigid with the camera: in a one-axis-at-a-time search over 3 translations (3-4 mm steps) and 3 rotations (1.5 deg
+steps), -18 mm along x is the only change that helps (silhouette IoU 0.31 -> 0.64); the 30 deg pitch, height, depth and
+roll are already right. No hand-eye calibration has been recorded."""
+
+
+def d405_wrist_camera_cfg(
+    arm_prim_name: str,
+    intrinsics: tuple[float, ...] = D405_COLOR_INTRINSICS,
+    data_types: tuple[str, ...] = ("rgb", "distance_to_image_plane"),
+    update_period: float = 1.0 / 30.0,
+    prim_name: str = "d405",
+) -> CameraCfg:
+    """A D405 on an arm's wrist mount, rigidly attached to the model's optical frame plus ``D405_IMAGER_OFFSET``
+    (30 Hz, 640 x 480 as recorded)."""
+    return CameraCfg(
+        prim_path=f"{{ENV_REGEX_NS}}/{arm_prim_name}/{D405_OPTICAL_FRAME}/{prim_name}",
+        update_period=update_period,
+        width=D405_WIDTH,
+        height=D405_HEIGHT,
+        data_types=list(data_types),
+        spawn=sim_utils.PinholeCameraCfg.from_intrinsic_matrix(
+            intrinsic_matrix=list(intrinsics), width=D405_WIDTH, height=D405_HEIGHT, clipping_range=(0.01, 10.0)
+        ),
+        offset=CameraCfg.OffsetCfg(pos=D405_IMAGER_OFFSET, convention="opengl"),
+    )
+
+
+@configclass
+class RpmLabDualArmCameraSceneCfg(RpmLabDualArmSceneCfg):
+    """The workcell with both wrist D405s (color stream, with depth aligned to it). Needs ``--enable_cameras``."""
+
+    thunder_wrist_camera: CameraCfg = d405_wrist_camera_cfg("Thunder")
+    lightning_wrist_camera: CameraCfg = d405_wrist_camera_cfg("Lightning")

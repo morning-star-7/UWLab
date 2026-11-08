@@ -19,16 +19,16 @@ tool writes ``robot.usda``, a small layer that sublayers the source USD unchange
 It writes a matching ``metadata.yaml``. Before writing, it checks that the source calibration reproduces the source
 USD's joint frames and link poses exactly. Run it with any Python that has ``pxr`` (no Isaac Sim app needed):
 
-    D=/data/kanth042/datasets/umi_reset_from_defaults_20260911
+    A=/data/cui00191/rpm_lab_assets   # sources/: verbatim copies of kanth042's reviewed builds
     C=scripts_v2/tools/rpm_lab/ur5e_calibration
     python scripts_v2/tools/rpm_lab/build_calibrated_ur5e_usd.py --real_joint_limits \\
-        --source_usd $D/124_official_robotiq_d405_20260926/assets_visualfix/robot/robot.usd \\
+        --source_usd $A/sources/124_official_robotiq_d405_20260926_visualfix/robot.usd \\
         --source_calibration $C/thunder_kinematics.yaml --calibration $C/lightning_kinematics.yaml \\
-        --robot lightning --out_dir /data/cui00191/rpm_lab_assets/lightning_124_official_robotiq_d405/robot
+        --robot lightning --out_dir $A/lightning_124_official_robotiq_d405/robot
     python scripts_v2/tools/rpm_lab/build_calibrated_ur5e_usd.py --real_joint_limits \\
-        --source_usd $D/189_official_umi_fingertips_20261003/assets_visualfix/robot/robot.usd \\
+        --source_usd $A/sources/189_official_umi_fingertips_20261003_visualfix/robot.usd \\
         --source_calibration $C/thunder_kinematics.yaml --calibration $C/thunder_kinematics.yaml \\
-        --robot thunder --out_dir /data/cui00191/rpm_lab_assets/thunder_189_official_umi_fingertips/robot
+        --robot thunder --out_dir $A/thunder_189_official_umi_fingertips/robot
 """
 
 import argparse
