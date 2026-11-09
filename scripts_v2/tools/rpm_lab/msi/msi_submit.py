@@ -54,10 +54,12 @@ def remote(host: str, command: str, stdin: str | None = None) -> subprocess.Comp
     return run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, command], input=stdin)
 
 
-def hours_minus(time_limit: str, minutes: int) -> str:
-    """Lightning max_time (DD:HH:MM:SS) ``minutes`` before a Slurm HH:MM:SS limit."""
+def stop_before(time_limit: str) -> str:
+    """Lightning max_time (DD:HH:MM:SS) that ends training ahead of a Slurm HH:MM:SS limit: 10% of the limit early,
+    at least 3 min (startup and data loading are not in max_time), at most 30 min: a 24 h job stops 30 min early."""
     h, m, s = (int(x) for x in time_limit.split(":"))
-    total = max(60, h * 3600 + m * 60 + s - minutes * 60)
+    limit = h * 3600 + m * 60 + s
+    total = limit - min(1800, max(180, limit // 10))
     return f"{total // 86400:02d}:{total % 86400 // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
 
 
@@ -138,7 +140,7 @@ def main():
         "STAGE": str(args.stage),
         "DATASET": args.dataset,
         "LOAD_AE_RUN": args.load_ae_run,
-        "MAX_TIME": hours_minus(args.time, 30),
+        "MAX_TIME": stop_before(args.time),
         "TRAIN_ARGS_B64": base64.b64encode(json.dumps(args.train_args).encode()).decode(),
     }
     export = "ALL," + ",".join(f"{k}={v}" for k, v in exports.items())
