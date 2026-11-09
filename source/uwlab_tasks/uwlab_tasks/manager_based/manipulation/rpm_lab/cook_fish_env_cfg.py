@@ -1,0 +1,345 @@
+# Copyright (c) 2024-2026, The UW Lab Project Developers. (https://github.com/uw-lab/UWLab/blob/main/CONTRIBUTORS.md).
+# All Rights Reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Lightning single-arm cook_fish on the RPM Lab twin: open the lid, put the fish in the pot, close the lid.
+
+Set up like the 2026-10-28 real cook_fish recordings: the same objects (``build_cook_fish_assets.py``: sizes from those
+recordings), Lightning starting where the operator started, Thunder parked at its teleop home outside the scene_1
+view, and the real action (six joint commands plus a gripper command at 20 Hz, executed through the servoJ model). The
+reset places the pot where the real pots were, the lid on it with its handle turned the way the operators grasped it,
+and the fish anywhere around the pot. Mimic splits a demo into six subtasks: grasp the lid, set it down beside the
+pot, grasp the fish, drop it into the pot, grasp the lid again, put it back on the pot.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import os
+import torch
+import yaml
+
+import isaaclab.sim as sim_utils
+import isaaclab.utils.math as math_utils
+from isaaclab.assets import RigidObject, RigidObjectCfg
+from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg, mdp
+from isaaclab.envs.mimic_env_cfg import MimicEnvCfg, SubTaskConfig
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.utils import configclass
+
+from . import scene_cfg as lab
+from .pick_place_env_cfg import (
+    ARM_DAMPING,
+    ARM_JOINTS,
+    ARM_STIFFNESS,
+    ActionsCfg,
+    finger_angle,
+    object_pos,
+    object_quat,
+    tcp_pos,
+    tcp_quat,
+)
+from .sensors import reattach_mounted_cameras_event
+
+INSTRUCTION = "open lid, place fish inside and close lid"
+"""The real episodes' language instruction (``task`` in the LeRobot datasets)."""
+
+OBJECTS_DIR = os.path.join(lab.ASSET_ROOT, "objects")
+
+
+def _object(name: str) -> tuple[str, dict]:
+    with open(os.path.join(OBJECTS_DIR, name, "metadata.yaml")) as f:
+        return os.path.join(OBJECTS_DIR, name, f"{name}.usda"), yaml.safe_load(f)
+
+
+POT_USD, POT = _object("pot")
+LID_USD, LID = _object("lid")
+FISH_USD, FISH = _object("fish")
+"""USDs and dimensions (``metadata.yaml``) from ``build_cook_fish_assets.py``. Origins are at the bottom center; the lid
+handle runs along the lid's x axis, the fish's length along its x axis."""
+
+COOK_FISH_START_JOINT_POS = {
+    "shoulder_pan_joint": -3.163,
+    "shoulder_lift_joint": -2.918,
+    "elbow_joint": -1.172,
+    "wrist_1_joint": -2.939,
+    "wrist_2_joint": -0.090,
+    "wrist_3_joint": 2.258,
+}
+"""Lightning's start in real episode 20261028-185333, the one closest to the per-joint median of the 10/28 cook_fish
+starts: grasp point about 0.23 m above the table, gripper pointing down."""
+
+POT_X_RANGE = (-0.17, 0.03)
+POT_Y_RANGE = (-0.17, -0.10)
+"""Pot center (world) at reset: the span of the real pot positions, read off where the gripper closed on the lid."""
+LID_YAW_RANGE = (1.50, 2.25)
+"""Handle direction (world yaw, rad). The operators closed the gripper with its closing axis (grasp-point x) at -4..39
+deg yaw, at a right angle to the handle; scene_1 shows the handle running along world y."""
+FISH_DISTANCE = (0.13, 0.20)
+"""Fish center distance from the pot center; any direction that keeps the fish in ``OBJECT_X/Y_RANGE``."""
+FISH_YAW_RANGE = (1.27, 2.37)  # the fish's length across the operators' closing axis
+OBJECT_X_RANGE = (-0.36, 0.06)
+OBJECT_Y_RANGE = (-0.36, -0.04)
+"""Where objects may lie (world): inside Lightning's real teleop workspace, clear of the table's front edge."""
+POT_POS = (-0.07, -0.13, lab.WORK_SURFACE_Z)
+FISH_POS = (-0.22, -0.16, lab.WORK_SURFACE_Z)
+
+GRIPPER_OPEN_BELOW = 0.2  # finger_joint (rad): released
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# MDP terms
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def handle_pos(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """(N, 3) lid handle center (the bar's axis at mid-length), env frame."""
+    lid: RigidObject = env.scene["lid"]
+    offset = torch.tensor([0.0, 0.0, LID["handle_height"]], device=env.device).expand(env.num_envs, 3)
+    return lid.data.root_pos_w - env.scene.env_origins + math_utils.quat_apply(lid.data.root_quat_w, offset)
+
+
+def lid_grasped(env: ManagerBasedRLEnv, max_distance: float = 0.025, min_closure: float = 0.4) -> torch.Tensor:
+    """1 while the grasp point is at the handle and the fingers have closed on it (the bar is thin: nearly shut)."""
+    near = (handle_pos(env) - tcp_pos(env)).norm(dim=-1) < max_distance
+    return (near & (finger_angle(env)[:, 0] > min_closure)).float()
+
+
+def fish_grasped(env: ManagerBasedRLEnv, max_distance: float = 0.03, min_closure: float = 0.15) -> torch.Tensor:
+    fish = object_pos(env, SceneEntityCfg("fish")) + torch.tensor([0.0, 0.0, 0.5 * FISH["size"][2]], device=env.device)
+    near = (fish - tcp_pos(env)).norm(dim=-1) < max_distance
+    return (near & (finger_angle(env)[:, 0] > min_closure)).float()
+
+
+def _released(env: ManagerBasedRLEnv) -> torch.Tensor:
+    return finger_angle(env)[:, 0] < GRIPPER_OPEN_BELOW
+
+
+def _fish_inside(env: ManagerBasedRLEnv) -> torch.Tensor:
+    pot, fish = object_pos(env, SceneEntityCfg("pot")), object_pos(env, SceneEntityCfg("fish"))
+    centered = (fish[:, :2] - pot[:, :2]).norm(dim=-1) < POT["inner_radius"] - 0.02
+    return centered & (fish[:, 2] < pot[:, 2] + POT["rim_height"] - FISH["size"][2] + 0.01)
+
+
+def _lid_on_pot(env: ManagerBasedRLEnv, xy_tolerance: float = 0.012, z_tolerance: float = 0.006) -> torch.Tensor:
+    pot, lid = object_pos(env, SceneEntityCfg("pot")), object_pos(env, SceneEntityCfg("lid"))
+    centered = (lid[:, :2] - pot[:, :2]).norm(dim=-1) < xy_tolerance
+    seated = (lid[:, 2] - pot[:, 2] - POT["rim_height"]).abs() < z_tolerance
+    lid_up = math_utils.quat_apply(
+        object_quat(env, SceneEntityCfg("lid")),
+        torch.tensor([[0.0, 0.0, 1.0]], device=env.device).expand(env.num_envs, 3),
+    )
+    return centered & seated & (lid_up[:, 2] > math.cos(0.15))
+
+
+def lid_off(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """1 once the lid lies on the table beside the pot and the gripper has let go."""
+    pot, lid = object_pos(env, SceneEntityCfg("pot")), object_pos(env, SceneEntityCfg("lid"))
+    beside = (lid[:, :2] - pot[:, :2]).norm(dim=-1) > POT["radius"] + LID["radius"] - 0.01
+    on_table = lid[:, 2] < lab.WORK_SURFACE_Z + LID["lip_depth"] + 0.01
+    return (beside & on_table & _released(env)).float()
+
+
+def fish_in_pot(env: ManagerBasedRLEnv) -> torch.Tensor:
+    return (_fish_inside(env) & _released(env)).float()
+
+
+def lid_regrasped(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """The second lid grasp (fish already in the pot): its own signal, since Mimic splits on a signal's first rise."""
+    return lid_grasped(env) * _fish_inside(env).float()
+
+
+def cook_fish_success(env: ManagerBasedRLEnv) -> torch.Tensor:
+    return _lid_on_pot(env) & _fish_inside(env) & _released(env)
+
+
+def object_fell(env: ManagerBasedRLEnv) -> torch.Tensor:
+    low = lab.WORK_SURFACE_Z - 0.05
+    return torch.stack([object_pos(env, SceneEntityCfg(n))[:, 2] < low for n in ("pot", "lid", "fish")]).any(dim=0)
+
+
+def reset_cook_fish_layout(env: ManagerBasedRLEnv, env_ids: torch.Tensor, candidates: int = 32):
+    """Pot in ``POT_X/Y_RANGE``, lid seated on it, fish around it (``FISH_DISTANCE``, inside ``OBJECT_X/Y_RANGE``)."""
+    n, device = len(env_ids), env.device
+    origins = env.scene.env_origins[env_ids]
+
+    def uniform(low, high, *shape):
+        return torch.empty(*(shape or (n,)), device=device).uniform_(low, high)
+
+    def yaw_quat(yaw):
+        zeros = torch.zeros_like(yaw)
+        return math_utils.quat_from_euler_xyz(zeros, zeros, yaw)
+
+    z = lab.WORK_SURFACE_Z + 0.0005
+    pot = torch.stack([uniform(*POT_X_RANGE), uniform(*POT_Y_RANGE), torch.full((n,), z, device=device)], dim=-1)
+    lid = pot + torch.tensor([0.0, 0.0, POT["rim_height"] + 0.0005], device=device)
+    # Fish: the first of several random directions that keeps it inside the object area.
+    distance, angle = uniform(*FISH_DISTANCE, n, candidates), uniform(-math.pi, math.pi, n, candidates)
+    xy = pot[:, None, :2] + distance[..., None] * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
+    inside = (
+        (xy[..., 0] > OBJECT_X_RANGE[0])
+        & (xy[..., 0] < OBJECT_X_RANGE[1])
+        & (xy[..., 1] > OBJECT_Y_RANGE[0])
+        & (xy[..., 1] < OBJECT_Y_RANGE[1])
+    )
+    first = inside.int().argmax(dim=1)
+    fish = torch.cat([xy[torch.arange(n, device=device), first], pot[:, 2:]], dim=-1)
+
+    poses = {
+        "pot": (pot, yaw_quat(uniform(-0.4, 0.4))),
+        "lid": (lid, yaw_quat(uniform(*LID_YAW_RANGE))),
+        "fish": (fish, yaw_quat(uniform(*FISH_YAW_RANGE))),
+    }
+    for name, (pos, quat) in poses.items():
+        obj: RigidObject = env.scene[name]
+        obj.write_root_pose_to_sim(torch.cat([pos + origins, quat], dim=-1), env_ids=env_ids)
+        obj.write_root_velocity_to_sim(torch.zeros(n, 6, device=device), env_ids=env_ids)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _rigid_object(name: str, usd_path: str, pos: tuple[float, float, float]) -> RigidObjectCfg:
+    return RigidObjectCfg(
+        prim_path=f"{{ENV_REGEX_NS}}/{name}",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=usd_path,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                solver_position_iteration_count=16, solver_velocity_iteration_count=1, max_depenetration_velocity=1.0
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.002, rest_offset=0.0),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=pos),
+    )
+
+
+@configclass
+class LightningCookFishSceneCfg(lab.RpmLabDualArmSceneCfg):
+    pot = _rigid_object("Pot", POT_USD, POT_POS)
+    lid = _rigid_object("Lid", LID_USD, (POT_POS[0], POT_POS[1], POT_POS[2] + POT["rim_height"]))
+    fish = _rigid_object("Fish", FISH_USD, FISH_POS)
+
+
+@configclass
+class ObservationsCfg:
+    @configclass
+    class PolicyCfg(ObsGroup):
+        actions = ObsTerm(func=mdp.last_action)
+        joint_pos = ObsTerm(func=mdp.joint_pos, params={"asset_cfg": SceneEntityCfg("lightning")})
+        eef_pos = ObsTerm(func=tcp_pos)
+        eef_quat = ObsTerm(func=tcp_quat)
+        gripper = ObsTerm(func=finger_angle)
+        pot_pos = ObsTerm(func=object_pos, params={"asset_cfg": SceneEntityCfg("pot")})
+        lid_pos = ObsTerm(func=object_pos, params={"asset_cfg": SceneEntityCfg("lid")})
+        lid_quat = ObsTerm(func=object_quat, params={"asset_cfg": SceneEntityCfg("lid")})
+        fish_pos = ObsTerm(func=object_pos, params={"asset_cfg": SceneEntityCfg("fish")})
+        fish_quat = ObsTerm(func=object_quat, params={"asset_cfg": SceneEntityCfg("fish")})
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = False
+
+    @configclass
+    class SubtaskCfg(ObsGroup):
+        lid_grasped = ObsTerm(func=lid_grasped)
+        lid_off = ObsTerm(func=lid_off)
+        fish_grasped = ObsTerm(func=fish_grasped)
+        fish_in_pot = ObsTerm(func=fish_in_pot)
+        lid_regrasped = ObsTerm(func=lid_regrasped)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = False
+
+    policy: PolicyCfg = PolicyCfg()
+    subtask_terms: SubtaskCfg = SubtaskCfg()
+
+
+@configclass
+class EventCfg:
+    reset_scene = EventTerm(func=mdp.reset_scene_to_default, mode="reset", params={"reset_joint_targets": True})
+    reattach_cameras = EventTerm(func=reattach_mounted_cameras_event, mode="reset")
+    layout = EventTerm(func=reset_cook_fish_layout, mode="reset")
+
+
+@configclass
+class TerminationsCfg:
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    object_fell = DoneTerm(func=object_fell)
+    success = DoneTerm(func=cook_fish_success)
+
+
+@configclass
+class LightningCookFishEnvCfg(ManagerBasedRLEnvCfg):
+    scene: LightningCookFishSceneCfg = LightningCookFishSceneCfg(num_envs=1, env_spacing=4.0, replicate_physics=False)
+    observations: ObservationsCfg = ObservationsCfg()
+    actions: ActionsCfg = ActionsCfg()
+    events: EventCfg = EventCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+    commands = None
+    rewards = None
+
+    def __post_init__(self):
+        self.decimation = 6  # 120 Hz physics, 20 Hz control as in the real datasets
+        self.episode_length_s = 45.0
+        self.sim.dt = 1.0 / 120.0
+        self.sim.render_interval = self.decimation
+        self.sim.physx.bounce_threshold_velocity = 0.01
+        self.sim.physx.friction_correlation_distance = 0.00625
+        # Lightning tracks the joint commands with a stiff PD (the scene default is torque control).
+        self.scene.lightning = copy.deepcopy(lab.LIGHTNING_CFG)
+        self.scene.lightning.init_state.joint_pos = {
+            **COOK_FISH_START_JOINT_POS,
+            **lab.OFFICIAL_ROBOTIQ_JOINT_POS,
+        }
+        # Thunder holds its teleop home, outside the scene_1 view as in the real Lightning-only recordings.
+        self.scene.thunder = copy.deepcopy(lab.THUNDER_CFG)
+        self.scene.thunder.init_state.joint_pos = {
+            **lab.THUNDER_TELEOP_HOME_JOINT_POS,
+            **lab.OFFICIAL_ROBOTIQ_JOINT_POS,
+        }
+        for robot in (self.scene.lightning, self.scene.thunder):
+            arm = robot.actuators["arm"]
+            arm.stiffness = dict(zip(ARM_JOINTS, ARM_STIFFNESS))
+            arm.damping = dict(zip(ARM_JOINTS, ARM_DAMPING))
+
+
+@configclass
+class LightningCookFishMimicEnvCfg(LightningCookFishEnvCfg, MimicEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.datagen_config.name = "lightning_cook_fish"
+        self.datagen_config.generation_guarantee = True
+        self.datagen_config.generation_keep_failed = False
+        self.datagen_config.generation_num_trials = 10
+        self.datagen_config.generation_select_src_per_subtask = True
+        self.datagen_config.generation_transform_first_robot_pose = False
+        self.datagen_config.generation_interpolate_from_last_target_pose = True
+        self.datagen_config.max_num_failures = 50
+        self.datagen_config.seed = 1
+        common = dict(
+            selection_strategy="nearest_neighbor_object",
+            selection_strategy_kwargs={"nn_k": 3},
+            action_noise=0.003,
+            num_interpolation_steps=5,
+            num_fixed_steps=0,
+            apply_noise_during_interpolation=False,
+        )
+        grasp = dict(subtask_term_offset_range=(5, 10), **common)
+        place = dict(subtask_term_offset_range=(0, 5), **common)
+        self.subtask_configs["lightning"] = [
+            SubTaskConfig(object_ref="lid", subtask_term_signal="lid_grasped", **grasp),
+            SubTaskConfig(object_ref="pot", subtask_term_signal="lid_off", **place),
+            SubTaskConfig(object_ref="fish", subtask_term_signal="fish_grasped", **grasp),
+            SubTaskConfig(object_ref="pot", subtask_term_signal="fish_in_pot", **place),
+            SubTaskConfig(object_ref="lid", subtask_term_signal="lid_regrasped", **grasp),
+            SubTaskConfig(object_ref="pot", subtask_term_signal=None, subtask_term_offset_range=(0, 0), **common),
+        ]

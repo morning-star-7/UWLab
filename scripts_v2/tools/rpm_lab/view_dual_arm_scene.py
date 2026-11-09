@@ -48,6 +48,7 @@ from isaaclab.sensors import CameraCfg
 from pxr import Usd, UsdGeom
 
 from uwlab_tasks.manager_based.manipulation.rpm_lab import scene_cfg as lab
+from uwlab_tasks.manager_based.manipulation.rpm_lab.sensors import reattach_mounted_cameras
 
 ARM_JOINTS = [
     "shoulder_pan_joint",
@@ -58,7 +59,7 @@ ARM_JOINTS = [
     "wrist_3_joint",
 ]
 CALIBRATION_ENTRIES = ["shoulder", "upper_arm", "forearm", "wrist_1", "wrist_2", "wrist_3"]
-CALIBRATION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ur5e_calibration")
+CALIBRATION_DIR = lab.CALIBRATION_DIR
 EE_BODY = "wrist_3_link"  # its frame is the controller's tool0 (flange)
 GRIPPER_BODY = "robotiq_base_link"
 X = lab.MIRROR_PLANE_X
@@ -204,10 +205,13 @@ def report(sim, scene) -> dict[str, float]:
     mirrored = math_utils.matrix_from_quat(thunder.data.root_quat_w[0]).clone()
     mirrored[0, :] *= -1.0  # reflect world x
     mirrored[:, 0] *= -1.0  # negate base x: right-handed again (scene_cfg.mirror_mount_pose)
-    out["base_mirror_mm"] = (mirror_points(t_pos) - l_pos).norm().item() * 1e3
+    correction = torch.tensor(lab.LIGHTNING_POS_CORRECTION, device=l_pos.device)
+    out["base_mirror_mm"] = (mirror_points(t_pos) + correction - l_pos).norm().item() * 1e3
     out["base_mirror_deg"] = rotation_angle_deg(mirrored, math_utils.matrix_from_quat(lightning.data.root_quat_w[0]))
     print(
-        f"Lightning base vs mirror image of Thunder's: {out['base_mirror_mm']:.3f} mm, {out['base_mirror_deg']:.4f} deg"
+        f"Lightning base vs mirror image of Thunder's + measured correction "
+        f"{[round(v * 1e3, 1) for v in lab.LIGHTNING_POS_CORRECTION]} mm: {out['base_mirror_mm']:.3f} mm, "
+        f"{out['base_mirror_deg']:.4f} deg"
     )
 
     print("\n=== Mounting plates (lab CAD) ===")
@@ -251,7 +255,7 @@ def report(sim, scene) -> dict[str, float]:
         tilt = math.degrees(math.acos(max(-1.0, min(1.0, -approach[2].item()))))
         offset = metadata(robot)["gripper_offset"]["pos"][0]
         print(
-            f"{name:9s} TCP {[round(v, 4) for v in pos[0].tolist()]}, {(pos[0, 2].item() - lab.TABLE_TOP_Z) * 1e3:.1f} mm "
+            f"{name:9s} TCP {[round(v, 4) for v in pos[0].tolist()]}, {(pos[0, 2].item() - lab.WORK_SURFACE_Z) * 1e3:.1f} mm "
             f"above the tabletop, approach axis {tilt:.1f} deg from straight down (gripper_offset {offset:.4f} m)"
         )
     return out
@@ -316,6 +320,7 @@ def main():
         )
     scene = InteractiveScene(scene_cfg)
     sim.reset()
+    reattach_mounted_cameras(scene)  # wrist cameras follow their links (rpm_lab/sensors.py)
     reset_to_defaults(scene)
     step(sim, scene)
 

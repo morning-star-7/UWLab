@@ -15,8 +15,12 @@ _PKG = "uwlab_tasks.manager_based.manipulation.rpm_lab"
 
 TASKS = {
     "UWLab-RPMLab-Lightning-PickPlace-Mimic-v0": {
-        "entry_point": f"{_PKG}.pick_place_mimic_env:LightningPickPlaceMimicEnv",
+        "entry_point": f"{_PKG}.lightning_mimic_env:LightningMimicEnv",
         "env_cfg_entry_point": f"{_PKG}.pick_place_env_cfg:LightningPickPlaceMimicEnvCfg",
+    },
+    "UWLab-RPMLab-Lightning-CookFish-Mimic-v0": {
+        "entry_point": f"{_PKG}.lightning_mimic_env:LightningMimicEnv",
+        "env_cfg_entry_point": f"{_PKG}.cook_fish_env_cfg:LightningCookFishMimicEnvCfg",
     },
 }
 

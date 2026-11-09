@@ -17,7 +17,7 @@ measured mounting (branch ``thunder-umi-sim2real``: ``umi_reset_cfg.py`` and
   image of that pose (see :func:`mirror_mount_pose`). Both real arms have the base cable opening pointing down, unlike
   the CAD (horizontal).
 * Each arm model carries that arm's own UR factory kinematic calibration
-  (``scripts_v2/tools/rpm_lab/ur5e_calibration``) and the real UR5e joint position and speed limits.
+  (``calibration/<arm>_kinematics.yaml``) and the real UR5e joint position and speed limits.
 
 The real recordings on the lab's robot PC (Zeus, ``spark-data-collection``) confirm the mounting. The controllers
 report flange poses in their base frames. Placed with these mounts, the recorded pick-and-place gripper paths stay
@@ -49,6 +49,8 @@ from isaaclab.sensors import CameraCfg
 from isaaclab.utils import configclass
 
 from uwlab_assets.robots.ur5e_robotiq_gripper import IMPLICIT_UR5E_ROBOTIQ_2F85
+
+from .dressing import CableCfg
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Assets
@@ -88,6 +90,20 @@ the real UR5e joint limits as for Thunder (the real Lightning's wrist_1 reaches 
 ``scripts_v2/tools/rpm_lab/build_calibrated_ur5e_usd.py`` (its docstring has the command).
 """
 
+CALIBRATION_DIR = os.path.join(os.path.dirname(__file__), "calibration")
+
+UR_CALIBRATION = {
+    "thunder": os.path.join(CALIBRATION_DIR, "thunder_kinematics.yaml"),
+    "lightning": os.path.join(CALIBRATION_DIR, "lightning_kinematics.yaml"),
+}
+"""Each arm's UR factory kinematic calibration, from ``Hardware/robot_calibration/ur5e`` in
+RPM-lab-UMN/spark-data-collection; each matches its controller's reported flange pose to 0.002 mm."""
+
+SERVOJ_MODEL = {"thunder": (0.072, 0.020), "lightning": (0.048, 0.020)}
+"""(delay s, first-order lag s) from a teleop joint command to the measured joints, per arm: the controllers' servoJ
+(lookahead 0.05 s, gain 200) fitted on the 2026-11-06 dual-arm recording (``replay_recording.py --arm servo``)."""
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Lab geometry (world frame)
 # ---------------------------------------------------------------------------------------------------------------------
@@ -100,6 +116,16 @@ TABLE_TOP_Z = 0.84235
 TABLE_X_RANGE = (-0.83484, 0.65016)
 TABLE_Y_RANGE = (-0.43230, 0.28770)
 """World extent of the tabletop."""
+
+CLOTH_THICKNESS = 0.003
+"""The real tabletop is covered with a cloth, modeled as a 3 mm static collider (``CLOTH_CFG``).
+
+In five 2026-10-28 cook_fish episodes (with ``LIGHTNING_POS_CORRECTION``), Lightning's lowest hand point during its
+table-level grasps sits -6 to +7 mm from the bare CAD tabletop (pressing into the cloth and a soft object at the low
+end), so the real contact surface is a few millimeters above the CAD top."""
+
+WORK_SURFACE_Z = TABLE_TOP_Z + CLOTH_THICKNESS
+"""Height of the surface objects rest on (top of the cloth)."""
 
 MIRROR_PLANE_X = -0.09234
 """The lab's symmetry plane, x = const.
@@ -167,11 +193,19 @@ def mirror_mount_pose(
     return (2.0 * plane_x - pos[0], pos[1], pos[2]), _matrix_to_quat(proper)
 
 
-LIGHTNING_POS, LIGHTNING_ROT = mirror_mount_pose(THUNDER_POS, THUNDER_ROT, MIRROR_PLANE_X)
-"""Lightning's ``base_link`` pose: (-0.36234, 0.377695, 1.466) and (0.5, 0.5, -0.5, -0.5).
+LIGHTNING_POS_CORRECTION = (0.002, -0.010, 0.006)
+"""Measured offset (m, world) of the real Lightning base from the mirror image of Thunder's mount.
 
-The mirror image of Thunder's corrected mount. Columns of the rotation: base x -> world -y, base y -> world +z (up),
-base z (mount normal) -> world -x. The cable opening (base -y) points down, as on the real Lightning.
+Fitted with ``scripts_v2/tools/rpm_lab/fit_arm_base_from_scene_camera.py`` on 40 scene_1 frames of five 2026-10-28
+cook_fish episodes: the arm's sim silhouette outline vs the real image edges, through the scene_1 camera, which is
+calibrated in Thunder's frame. Mean outline-to-edge distance 5.5 px -> 4.5 px; each axis has a clear minimum
+(+-5 mm costs 0.1-0.3 px)."""
+
+_LIGHTNING_MIRROR_POS, LIGHTNING_ROT = mirror_mount_pose(THUNDER_POS, THUNDER_ROT, MIRROR_PLANE_X)
+LIGHTNING_POS = tuple(p + c for p, c in zip(_LIGHTNING_MIRROR_POS, LIGHTNING_POS_CORRECTION))
+"""Lightning's ``base_link`` pose: the mirror image of Thunder's corrected mount, (-0.36234, 0.377695, 1.466) and
+(0.5, 0.5, -0.5, -0.5), plus ``LIGHTNING_POS_CORRECTION``. Columns of the rotation: base x -> world -y, base y -> world
++z (up), base z (mount normal) -> world -x. The cable opening (base -y) points down, as on the real Lightning.
 """
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -192,6 +226,18 @@ S-W-E- arm shape, gripper 5 deg from straight down, hand 0.30 m above the table 
 (``scripts_v2/tools/thunder_sim2real/workstation/run_state_policy.py`` on ``thunder-umi-sim2real``). The real
 controller and this asset use the same joint angles.
 """
+
+THUNDER_TELEOP_HOME_JOINT_POS = {
+    "shoulder_pan_joint": 3.181920289993286,
+    "shoulder_lift_joint": -0.16607506573200226,
+    "elbow_joint": 0.2841489911079407,
+    "wrist_1_joint": -1.0576382875442505,
+    "wrist_2_joint": -0.10265476256608963,
+    "wrist_3_joint": -0.7487161755561829,
+}
+"""Thunder's teleop home on the robot PC (``TeleopSoftware/teleop_runtime_config.py``): hand at about (0.30, -0.50, 1.20),
+past the table's front edge and outside the scene_1 view. Use it to park Thunder during Lightning-only tasks; the
+2026-10-28 Lightning recordings never show Thunder in scene_1."""
 
 LIGHTNING_HOME_JOINT_POS = {
     "shoulder_pan_joint": -3.369978189468384,
@@ -275,12 +321,92 @@ LAB_CFG = RigidObjectCfg(
 )
 """The whole workcell as one kinematic body, named ``table`` in the scene as in Thunder's task configs."""
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Appearance (matched to the scene_1 L515 frames of the 2026-10-28 cook_fish episodes)
+# ---------------------------------------------------------------------------------------------------------------------
+
+DOME_LIGHT_INTENSITY = 240.0
+"""The scene's dome light (white). With ``CLOTH_COLOR`` it renders the cloth at the real scene_1 color (median RGB
+106, 113, 108 over the plain cloth; sim about 107, 111, 108). The robot asset builds each carried a dome light of their
+own, which multiplied with the number of envs (4 envs rendered 70% brighter); ``build_calibrated_ur5e_usd.py``
+deactivates them, so the lighting is the same for any number of envs."""
+
+CLOTH_COLOR = (0.331, 0.350, 0.335)
+"""Cloth albedo: the real cloth's hue (scene_1) at the level that, under ``DOME_LIGHT_INTENSITY``, matches its brightness."""
+
+CAMERA_COLOR_GAIN = {"scene_1": (1.0, 1.0, 1.0), "lightning_wrist": (1.17, 1.14, 1.12)}
+"""Per-camera RGB gain applied to sim frames (8-bit, after rendering), standing in for each real camera's own exposure
+and white balance: the wrist D405 shows the same cloth brighter and warmer (median RGB 117..135 over three episodes,
+about 126, 128, 122) than scene_1 does."""
+
+BACKDROP_DEPTH = 0.5
+"""The real cloth continues past the table's far edge (y = ``TABLE_Y_RANGE[0]``) at table height to the top of the
+scene_1 image (y about -0.55 on the table plane); the sim shows the floor there without this visual-only strip."""
+
+CABLE_PATH = (
+    (-0.150, 0.215),
+    (-0.175, 0.172),
+    (-0.220, 0.153),
+    (-0.260, 0.139),
+    (-0.300, 0.130),
+    (-0.340, 0.127),
+    (-0.400, 0.125),
+    (-0.500, 0.127),
+    (-0.620, 0.128),
+)
+"""(x, y) of the loose black cable on the cloth near the robots' column: the median of its path in the last scene_1
+frame of the five 10/28 cook_fish episodes (dark pixels back-projected onto the cloth; the episodes agree within
+1-3 cm). It comes out of the dark band at the bottom of the image and leaves through the right edge."""
+
+CLOTH_CFG = AssetBaseCfg(
+    prim_path="{ENV_REGEX_NS}/Cloth",
+    spawn=sim_utils.CuboidCfg(
+        size=(TABLE_X_RANGE[1] - TABLE_X_RANGE[0], TABLE_Y_RANGE[1] - TABLE_Y_RANGE[0], CLOTH_THICKNESS),
+        collision_props=sim_utils.CollisionPropertiesCfg(),
+        physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.8, dynamic_friction=0.7),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=CLOTH_COLOR, roughness=1.0),
+    ),
+    init_state=AssetBaseCfg.InitialStateCfg(
+        pos=(
+            0.5 * (TABLE_X_RANGE[0] + TABLE_X_RANGE[1]),
+            0.5 * (TABLE_Y_RANGE[0] + TABLE_Y_RANGE[1]),
+            TABLE_TOP_Z + 0.5 * CLOTH_THICKNESS,
+        )
+    ),
+)
+"""The tablecloth: a static collider over the whole tabletop, with the cloth's gray-beige color."""
+
+BACKDROP_CFG = AssetBaseCfg(
+    prim_path="{ENV_REGEX_NS}/ClothBeyondTable",
+    spawn=sim_utils.CuboidCfg(
+        size=(TABLE_X_RANGE[1] - TABLE_X_RANGE[0], BACKDROP_DEPTH, CLOTH_THICKNESS),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=CLOTH_COLOR, roughness=1.0),
+    ),
+    init_state=AssetBaseCfg.InitialStateCfg(
+        pos=(
+            0.5 * (TABLE_X_RANGE[0] + TABLE_X_RANGE[1]),
+            TABLE_Y_RANGE[0] - 0.5 * BACKDROP_DEPTH,
+            TABLE_TOP_Z + 0.5 * CLOTH_THICKNESS,
+        )
+    ),
+)
+"""Cloth seen beyond the table's far edge (``BACKDROP_DEPTH``); visual only."""
+
+CABLE_CFG = AssetBaseCfg(
+    prim_path="{ENV_REGEX_NS}/Cable",
+    spawn=CableCfg(points=tuple((x, y, WORK_SURFACE_Z + 0.0035) for x, y in CABLE_PATH)),
+)
+"""The loose cable on the cloth (``CABLE_PATH``); visual only."""
+
 
 @configclass
 class RpmLabDualArmSceneCfg(InteractiveSceneCfg):
     """The lab workcell with Thunder and Lightning. Use ``env_spacing`` >= 4 m; the workcell is about 1.5 m x 0.9 m."""
 
     table: RigidObjectCfg = LAB_CFG
+    cloth: AssetBaseCfg = CLOTH_CFG
+    cloth_beyond_table: AssetBaseCfg = BACKDROP_CFG
+    cable: AssetBaseCfg = CABLE_CFG
     thunder: ArticulationCfg = THUNDER_CFG
     lightning: ArticulationCfg = LIGHTNING_CFG
 
@@ -292,7 +418,7 @@ class RpmLabDualArmSceneCfg(InteractiveSceneCfg):
 
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
-        spawn=sim_utils.DomeLightCfg(intensity=1500.0, color=(0.95, 0.95, 0.95)),
+        spawn=sim_utils.DomeLightCfg(intensity=DOME_LIGHT_INTENSITY, color=(1.0, 1.0, 1.0)),
     )
 
 
@@ -386,7 +512,7 @@ frames (``cv2.undistort``) before comparing or mixing them with sim renders."""
 
 SCENE_1_CALIBRATION_FILE = os.environ.get(
     "RPM_SCENE_1_CALIBRATION",
-    os.path.join(os.path.dirname(__file__), "calibration", "scene_1_l515_thunder_20261008.json"),
+    os.path.join(CALIBRATION_DIR, "scene_1_l515_thunder_20261008.json"),
 )
 """The lab's calibration of the scene_1 L515, saved verbatim from its calibration run.
 

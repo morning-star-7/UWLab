@@ -71,6 +71,7 @@ from isaaclab.sensors import CameraCfg
 from pxr import Usd, UsdGeom, UsdPhysics
 
 from uwlab_tasks.manager_based.manipulation.rpm_lab import scene_cfg as lab
+from uwlab_tasks.manager_based.manipulation.rpm_lab.sensors import reattach_mounted_cameras
 
 ARM_JOINTS = [
     "shoulder_pan_joint",
@@ -341,7 +342,7 @@ def hand_lowest(
         & (local[..., 1] > lab.TABLE_Y_RANGE[0])
         & (local[..., 1] < lab.TABLE_Y_RANGE[1])
     )
-    height = torch.where(inside, local[..., 2] - lab.TABLE_TOP_Z, torch.full_like(local[..., 2], float("inf")))
+    height = torch.where(inside, local[..., 2] - lab.WORK_SURFACE_Z, torch.full_like(local[..., 2], float("inf")))
     low, idx = height.min(dim=1)
     return low, local[torch.arange(len(idx), device=idx.device), idx]
 
@@ -439,7 +440,7 @@ def kinematic_check(sim, scene, rec: Recording) -> dict:
                 torch.where(exact, rotation_error_deg(flange[:, :3, :3], rec_rot), torch.nan)[sel].cpu().numpy()
             )
             o["tcp_h"].append(
-                (tcp_world(arm, pos, quat)[:, 2] - scene.env_origins[:, 2] - lab.TABLE_TOP_Z)[sel].cpu().numpy()
+                (tcp_world(arm, pos, quat)[:, 2] - scene.env_origins[:, 2] - lab.WORK_SURFACE_Z)[sel].cpu().numpy()
             )
             low, low_xyz = hand_lowest(arm, pos, quat, scene.env_origins)
             o["hand_h"].append(low[sel].cpu().numpy())
@@ -464,10 +465,10 @@ def kinematic_check(sim, scene, rec: Recording) -> dict:
             f"{np.nanmax(np.where(still, re, np.nan)):.5f} deg"
         )
         o["joint_speed"] = speed
-        print(f"  grasp point above tabletop (mm): {stats(o['tcp_h'])}")
-        print(f"  lowest hand collision point above tabletop (mm): {stats(o['hand_h'])}")
+        print(f"  grasp point above the work surface (cloth top, mm): {stats(o['tcp_h'])}")
+        print(f"  lowest hand collision point above the work surface (cloth top, mm): {stats(o['hand_h'])}")
         print(
-            f"  hand below the tabletop in {below.mean() * 100:.2f}% of frames (> 5 mm deep: "
+            f"  hand below the work surface in {below.mean() * 100:.2f}% of frames (> 5 mm deep: "
             f"{(o['hand_h'] < -0.005).mean() * 100:.2f}%); deepest {o['hand_h'][worst] * 1e3:.1f} mm at "
             f"t = {o['t'][worst]:.2f} s, gripper {o['grip'][worst]:.2f}"
         )
@@ -551,7 +552,7 @@ def replay(sim, scene, rec: Recording) -> dict:
             log[f"{name}.grip"].append(arm.reading(float(robot.data.joint_pos[0, arm.finger_id])))
             log[f"{name}.hand_h"].append(float(hand_lowest(arm, pos, quat, scene.env_origins)[0][0]))
             log[f"{name}.tcp_h"].append(
-                float(tcp_world(arm, pos, quat)[0, 2] - scene.env_origins[0, 2] - lab.TABLE_TOP_Z)
+                float(tcp_world(arm, pos, quat)[0, 2] - scene.env_origins[0, 2] - lab.WORK_SURFACE_Z)
             )
         if render:
             video.append_data(compose_frame(scene, rec, t))
@@ -577,8 +578,8 @@ def replay(sim, scene, rec: Recording) -> dict:
             f"  gripper opening vs measured: mean |error| {g_err.mean():.3f}, p95 {np.percentile(g_err, 95):.3f} "
             "(0..1 scale; the real fingers stop on objects, the sim's close freely)"
         )
-        print(f"  grasp point above tabletop (mm): {stats(log[f'{name}.tcp_h'])}")
-        print(f"  lowest hand collision point above tabletop (mm): {stats(log[f'{name}.hand_h'])}")
+        print(f"  grasp point above the work surface (cloth top, mm): {stats(log[f'{name}.tcp_h'])}")
+        print(f"  lowest hand collision point above the work surface (cloth top, mm): {stats(log[f'{name}.hand_h'])}")
     if args.stills:
         save_stills(sim, scene, rec, arms)
     return log
@@ -701,6 +702,7 @@ def main():
             arm_actuator.damping = dict(zip(ARM_JOINTS, SERVO_DAMPING))
     scene = InteractiveScene(scene_cfg)
     sim.reset()
+    reattach_mounted_cameras(scene)  # wrist cameras follow their links (rpm_lab/sensors.py)
     place_bases(scene)
     scene.write_data_to_sim()
     sim.step(render=False)

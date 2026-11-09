@@ -5,7 +5,7 @@
 
 """Give a calibrated UR5e robot USD a given arm's factory kinematic calibration and the real UR5e joint limits.
 
-Each UR5e controller stores its own factory calibration (``ur5e_calibration/<arm>_kinematics.yaml``, copied from
+Each UR5e controller stores its own factory calibration (``rpm_lab/calibration/<arm>_kinematics.yaml``, copied from
 ``Hardware/robot_calibration/ur5e`` in RPM-lab-UMN/spark-data-collection; each matches its controller's reported flange
 pose to 0.002 mm). The source asset's arm joints carry one arm's calibration in ``physics:localPos0/localRot0``. This
 tool writes ``robot.usda``, a small layer that sublayers the source USD unchanged and overrides:
@@ -14,13 +14,15 @@ tool writes ``robot.usda``, a small layer that sublayers the source USD unchange
 * the authored link poses, rebuilt along the chain at the same authored joint angles, so the stage stays consistent;
 * the hand subtree (gripper, fingers, camera mount), moved rigidly with wrist_3_link;
 * with ``--real_joint_limits``, the arm joint limits: the controller's +-360 deg (elbow +-180 deg, ur_description
-  ``joint_limits.yaml``) instead of the source's +-180 deg wrists. The real arms use wrist angles beyond +-180 deg.
+  ``joint_limits.yaml``) instead of the source's +-180 deg wrists. The real arms use wrist angles beyond +-180 deg;
+* any light in the source asset (the builds carry a 1000-unit DomeLight), deactivated: the scene owns the lighting,
+  and an asset's light would be added again for every robot and every env.
 
 It writes a matching ``metadata.yaml``. Before writing, it checks that the source calibration reproduces the source
 USD's joint frames and link poses exactly. Run it with any Python that has ``pxr`` (no Isaac Sim app needed):
 
     A=/data/cui00191/rpm_lab_assets   # sources/: verbatim copies of kanth042's reviewed builds
-    C=scripts_v2/tools/rpm_lab/ur5e_calibration
+    C=source/uwlab_tasks/uwlab_tasks/manager_based/manipulation/rpm_lab/calibration
     python scripts_v2/tools/rpm_lab/build_calibrated_ur5e_usd.py --real_joint_limits \\
         --source_usd $A/sources/124_official_robotiq_d405_20260926_visualfix/robot.usd \\
         --source_calibration $C/thunder_kinematics.yaml --calibration $C/lightning_kinematics.yaml \\
@@ -38,7 +40,7 @@ import numpy as np
 import os
 import yaml
 
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 
 ARM = [  # (USD joint, calibration entry, parent link, child link)
     ("shoulder_pan_joint", "shoulder", "base_link", "shoulder_link"),
@@ -273,6 +275,10 @@ def main():
             raise RuntimeError(f"{name}: expected one transform op, found {[op.GetOpName() for op in ops]}")
         old = np.array(ops[0].Get()).T  # Gf matrices are row-vector
         ops[0].Set(Gf.Matrix4d((delta @ old).T.tolist()))
+    for prim in out.Traverse():
+        if prim.HasAPI(UsdLux.LightAPI):
+            prim.SetActive(False)
+            print(f"Deactivated the asset's light {prim.GetPath()}")
     layer.Save()
 
     # 4) Re-open and check the result against the target calibration.

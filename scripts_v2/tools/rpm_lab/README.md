@@ -6,12 +6,16 @@ real recordings copied from the lab robot PC (Zeus) in `/data/cui00191/rpm_lab_r
 
 | Tool | Runs in | What it does |
 |---|---|---|
-| `build_calibrated_ur5e_usd.py` | any Python with `pxr` | Writes a robot override layer: an arm's UR factory calibration (`ur5e_calibration/`) and the real UR5e joint limits. |
+| `build_calibrated_ur5e_usd.py` | any Python with `pxr` | Writes a robot override layer: an arm's UR factory calibration (`rpm_lab/calibration/`) and the real UR5e joint limits. |
 | `view_dual_arm_scene.py` | Isaac Sim | Checks mounts, mounting plates, calibration, limits and home poses; `--save_images` renders views and wrist cameras. |
 | `extract_spark_recording.py` | Python with `mcap mcap-ros2-support` (raw bags) or `pandas pyarrow` (LeRobot) | Converts a Zeus recording into one `.npz`. |
+| `fit_arm_base_from_scene_camera.py` | Isaac Sim | Fits an arm's base offset from scene_1 frames of real recordings (silhouette outline vs image edges). |
 | `replay_recording.py` | Isaac Sim | Checks the twin against a recording: `--mode kinematic` (flange vs controller, hand height over the table), `--mode replay --arm teleport\|servo` (physics replay, servoJ model fitted to the recording, video, real-vs-sim wrist stills). |
-| `scripted_pick_place_demos.py` | Isaac Sim | Records scripted source demos for Mimic (Isaac Lab demo HDF5). |
+| `build_cook_fish_assets.py` | any Python with `pxr` and `trimesh` | Builds the cook_fish pot, lid and fish USDs (+ `metadata.yaml` dimensions) from the real recordings' measurements. |
+| `scripted_demos.py` | Isaac Sim | Records scripted source demos for Mimic (Isaac Lab demo HDF5) on the pick-and-place or cook_fish task. |
 | `mimic.py` | Isaac Sim | Runs Isaac Lab Mimic's `annotate` / `generate` / `replay` scripts on the RPM Lab tasks. |
+| `render_mimic_dataset.py` | Isaac Sim | Renders a demo HDF5 through scene_1 and the wrist D405 in the real cameras' models; writes per-episode `.npz` with the real state/action schema. |
+| `export_lerobot_dataset.py` | lerobot 0.5.2 venv | Writes those episodes as a LeRobot v3 dataset with the real feature names (h264, 20 fps). |
 
 Isaac Sim on this server (no personal env): `PATH=/data/kanth042/envs/uwlab-isaac51/bin:$PATH OMNI_KIT_ACCEPT_EULA=YES
 PYTHONPATH=$PWD/source/uwlab:$PWD/source/uwlab_assets:$PWD/source/uwlab_tasks:$PWD/source/uwlab_rl python ... --headless`.
@@ -26,32 +30,69 @@ python scripts_v2/tools/rpm_lab/replay_recording.py --headless --mode replay --r
     --video $R/replays/ep1028.mp4 --stills $R/replays/ep1028_stills
 ```
 
-## Scripted demos + MimicGen (Lightning pick-and-place)
+## Scripted demos + MimicGen (Lightning tasks)
 
-Task `UWLab-RPMLab-Lightning-PickPlace-Mimic-v0` (`rpm_lab/pick_place_env_cfg.py`, `pick_place_mimic_env.py`): a
-45 mm cube onto a 100 mm plate, 20 Hz, absolute grasp-point pose in Lightning's base frame + binary gripper. Mimic
-subtasks: grasp (relative to the cube), place (relative to the plate). `isaaclab_mimic` and its missing deps (IPython,
-ipywidgets, tomli in `/data/cui00191/rpm_lab_pydeps`) are put on the path by `mimic.py`; nothing is installed into the
-shared environment.
+Both tasks use the real datasets' action: six absolute joint commands plus a gripper command in [0 open, 1 closed] at
+20 Hz, executed through the servoJ model fitted on real recordings (`rpm_lab/actions.py`). Mimic reasons in grasp-point
+poses; `rpm_lab/lightning_mimic_env.py` turns them into joint commands with IK on Lightning's factory calibration
+(`rpm_lab/kinematics.py`), seeded with the previous command, and back with FK. `isaaclab_mimic` and its missing deps
+(IPython, ipywidgets, tomli in `/data/cui00191/rpm_lab_pydeps`) are put on the path by `mimic.py`; nothing is installed
+into the shared environment.
+
+- `UWLab-RPMLab-Lightning-PickPlace-Mimic-v0` (`pick_place_env_cfg.py`): a 45 mm cube onto a 100 mm plate; subtasks
+  grasp (cube) and place (plate). 11/2026: 10/10 scripted, 10/10 annotated, 50/50 generated.
+- `UWLab-RPMLab-Lightning-CookFish-Mimic-v0` (`cook_fish_env_cfg.py`): "open lid, place fish inside and close lid",
+  set up like the 10/28 real episodes (below); subtasks lid grasped, lid set down beside the pot, fish grasped, fish in
+  the pot, lid grasped again, lid on the pot.
 
 ```bash
-M=/data/cui00191/rpm_lab_mimic
-python scripts_v2/tools/rpm_lab/scripted_pick_place_demos.py --headless --num_demos 10 --dataset_file $M/source.hdf5
-python scripts_v2/tools/rpm_lab/mimic.py annotate --auto --headless --input_file $M/source.hdf5 --output_file $M/annotated.hdf5
-python scripts_v2/tools/rpm_lab/mimic.py generate --headless --num_envs 8 --generation_num_trials 100 \
-    --input_file $M/annotated.hdf5 --output_file $M/generated_100.hdf5
+M=/data/cui00191/rpm_lab_mimic/cook_fish T=UWLab-RPMLab-Lightning-CookFish-Mimic-v0
+python scripts_v2/tools/rpm_lab/scripted_demos.py --headless --task $T --num_demos 10 --dataset_file $M/source.hdf5
+python scripts_v2/tools/rpm_lab/mimic.py annotate --task $T --auto --headless --input_file $M/source.hdf5 --output_file $M/annotated.hdf5
+python scripts_v2/tools/rpm_lab/mimic.py generate --headless --num_envs 8 --generation_num_trials 50 \
+    --input_file $M/annotated.hdf5 --output_file $M/generated_50.hdf5
 ```
 
-First run (11/2026): 10/10 scripted demos, 10/10 annotated, 100/101 generated (99%) in 6.6 min with 8 envs on a
-shared A6000. The datasets keep full sim states, so they can be re-rendered once the scene camera and appearance are
-fixed. Isaac Lab's IK term gets the Jacobian of an offset frame wrong on these arms (`rpm_lab/actions.py` explains and
-replaces it).
+The datasets keep full sim states, so they can be re-rendered whenever the cameras or the appearance change.
 
-Rendering a Mimic dataset from its states (`scene.reset_to` per step): in this task env a camera parented under a robot
-link does not follow the link (it renders from its spawn pose, even after physics steps or `set_world_poses`), unlike
-in the bare scene. Workaround that works: a free camera under the env prim, posed every frame from the link pose times
-the fixed link-to-camera transform (`D405_OPTICAL_FRAME` + `D405_IMAGER_OFFSET`). Preview of three generated demos:
-`/data/cui00191/rpm_lab_mimic/generated_100_preview.mp4`.
+### cook_fish, matched to the 10/28 recordings
+
+- Objects (`build_cook_fish_assets.py`): pot and lid about 130 mm across (scene_1 back-projection); heights from where
+  the operator's grasp point was when the gripper closed on the lid handle, about 82 mm above the table with the lid on
+  the pot and 39 mm with it on the table, so the rim is 45 mm up and the handle's axis 32 mm above the lid's underside.
+  The plush fish squashes under the real lid; the rigid one is 34 mm flat so the lid closes over it. The lid's centering
+  lip has 1 cm of radial play so a lid set down slightly off center still sits flat.
+- Layout: pot where the real pots were (x -0.17..0.03, y -0.17..-0.10), the lid on it with its handle along world y
+  (the operators closed the gripper with its closing axis within 40 deg of world x, at a right angle to the handle), the
+  fish 0.13-0.20 m from the pot in any direction that stays in Lightning's real workspace.
+- Lightning starts at real episode 185333's start; Thunder is parked at its teleop home, outside the scene_1 view.
+- The scripted policy re-plans each phase from the current state and carries held objects by their actual pose in the
+  hand; it drops the fish from 25 mm above the rim (the operators let go 25-60 mm above it).
+
+## Co-training data (LeRobot)
+
+```bash
+python scripts_v2/tools/rpm_lab/render_mimic_dataset.py --headless --num_envs 8 --dataset $M/generated_50.hdf5 --out $M/render
+/data/cui00191/rpm_lab_envs/lerobot/bin/python scripts_v2/tools/rpm_lab/export_lerobot_dataset.py \
+    --frames $M/render --root $M/lerobot --repo_id rpm_lab/sim_lightning_cook_fish
+```
+
+The render restores each step's sim state, renders scene_1 and the wrist D405, warps the pinhole renders into the real
+cameras' models (`cv2.remap`: principal point, L515 distortion) and applies each camera's color gain. It renders
+`--num_envs` episodes at once (one per env, tiled cameras; 4 cook_fish episodes, 1736 frames, in about 90 s plus 60 s
+startup on a shared A6000) and streams each camera into a near-lossless H.264 file (crf 10, 43-44 dB PSNR vs the raw
+render, about 5 MB per camera per episode instead of 400 MB raw) next to a small `.npz` of state, action and meta. The
+LeRobot export re-encodes like the robot PC (37-38 dB vs the raw render; 4 episodes, 7 MB). The export matches
+the robot PC's `multisensor_20hz` LeRobot v3 datasets feature for feature (names, dtypes, h264/yuv420p, 20 fps;
+checked against `published/cup_random`), and `observation.state`'s flange pose equals calibrated FK of the joints, as on
+the robot PC. The lerobot venv (`uv`, Python 3.12, lerobot 0.5.2 from git 5de7aa5a, CPU torch) is separate from Isaac Sim.
+
+Wrist cameras and Fabric: Isaac Lab's camera reads its pose through a Fabric `XformPrimView`, which on the first read
+(the camera's `reset`) copies the USD world pose into Fabric once. USD still has the spawn configuration (PhysX writes
+link poses only to Fabric), so if the arm has moved by then, as after a task env's first reset, the camera ends up at a
+fixed wrong offset from its link and stops following it. `rpm_lab/sensors.py` re-attaches mounted cameras (writes their
+authored local transform back into Fabric); the tasks run it as a reset event and the tools call it after
+`sim.reset()`. Preview of three generated demos: `/data/cui00191/rpm_lab_mimic/generated_100_preview.mp4`.
 
 ## Checked against the real arms (11/2026)
 
@@ -67,15 +108,26 @@ the fixed link-to-camera transform (`D405_OPTICAL_FRAME` + `D405_IMAGER_OFFSET`)
   cloth at 22.6 deg (calibration: 0.746 m above the bare top, 23.6 deg). So the camera had not moved and Lightning's
   placement relative to Thunder holds to the pixel level. Real frames have lens distortion: `cv2.undistort` them with
   `L515_COLOR_DISTORTION` before comparing with or mixing into the pinhole sim renders.
+- Lightning's base vs Thunder: fitted through the calibrated scene_1 camera (`fit_arm_base_from_scene_camera.py`, 40
+  frames of five 10/28 cook_fish episodes): +2, -10, +6 mm from the mirror image (`LIGHTNING_POS_CORRECTION`).
+- Table: the real tabletop carries a cloth; a 3 mm cloth collider (`CLOTH_CFG`, `WORK_SURFACE_Z`) puts the work
+  surface where Lightning's table-level grasps touch it (-6..+7 mm across the five episodes, after the correction).
+
+- Appearance (scene_1, 10/28 cook_fish frames): `DOME_LIGHT_INTENSITY` and `CLOTH_COLOR` render the cloth at the
+  real median RGB (sim 108/112/109 vs real 107/113/108; before, the cloth and the UR's blue caps came out near white).
+  The scene's dome is the only light: the robot builds' own dome lights are deactivated in their override layers
+  (they added up per env); the wrist D405 gets `CAMERA_COLOR_GAIN` (1.17, 1.14, 1.12) for its own exposure
+  (cloth 125/126/120 vs real 126/127/121). The cloth continues past the table's far edge (visual strip) and a loose
+  black cable lies near the column (`CABLE_PATH`, median of five episodes). Image timing: scene_1 frames line up with
+  the joint stream within 0.1 s, except each episode's first frame, which is stale.
 
 ## Known gaps
 
-- Lightning vs the table: during real table-level grasps Lightning's hand reaches 12 mm (10/2026) to ~30 mm (09/2026)
-  below the sim tabletop, so its height or tilt relative to the table is off. Needs a touch measurement (fingertip on
-  marked table points, record `getActualTCPPose`). The real table also has a cloth, which the sim lacks.
 - Wrist depth: back-projected real D405 depth disagrees with the sim geometry in a range-dependent way (apparent 14 deg
   table tilt) while the color images agree; unresolved, so depth is not used for calibration yet.
-- Omniverse cameras ignore the principal point (cx, cy forced to the image center; fx, fy averaged): sim frames are
-  shifted against real ones by up to 7.6 px (L515) / 4.5 px (D405). Warp sim renders to the real camera model
-  (K + distortion) with `cv2.remap` when building co-training data.
+- Omniverse cameras ignore the principal point (cx, cy forced to the image center; fx, fy averaged): raw sim frames are
+  shifted against real ones by up to 7.6 px (L515) / 4.5 px (D405); `render_mimic_dataset.py` warps them.
+- Not modeled: the dark band along the bottom of scene_1 (the real cloth seems to end near y = 0.17, the CAD tabletop
+  runs to 0.29), the USB cable looping from Lightning's wrist camera, the lid's arched strap handle (a straight bar
+  here), soft shadows from the ceiling lights, and steel reflections (RTX reflections are off).
 - Thunder's D405 intrinsics were never recorded (Lightning's are used); joint friction/armature are reference values.

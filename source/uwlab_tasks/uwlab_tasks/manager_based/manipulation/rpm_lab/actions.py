@@ -21,11 +21,14 @@ the controlled frame (max 6e-4 per column).
 
 from __future__ import annotations
 
+import math
 import torch
+from collections.abc import Sequence
 from dataclasses import MISSING
 
 import isaaclab.utils.math as math_utils
-from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
+from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg, JointPositionActionCfg
+from isaaclab.envs.mdp.actions.joint_actions import JointPositionAction
 from isaaclab.envs.mdp.actions.task_space_actions import DifferentialInverseKinematicsAction
 from isaaclab.utils import configclass
 
@@ -57,3 +60,63 @@ class GeometricJacobianDiffIKActionCfg(DifferentialInverseKinematicsActionCfg):
 
     joint_child_bodies: list[str] = MISSING
     """Child link of each controlled joint, in the order of ``joint_names``."""
+
+
+class ServoJointPositionAction(JointPositionAction):
+    """Absolute joint-position commands executed like the UR controller's servoJ.
+
+    The real arms receive teleop joint commands through ``servoJ`` and reach them after a delay and a first-order lag
+    (``scene_cfg.SERVOJ_MODEL``, fitted on recordings). This term applies the same model at the physics rate: the
+    command goes through a delay line and a first-order filter, and the result becomes the joint position target of a
+    stiff PD. The action is the command itself, as in the real datasets.
+    """
+
+    cfg: ServoJointPositionActionCfg
+
+    def __init__(self, cfg: ServoJointPositionActionCfg, env):
+        super().__init__(cfg, env)
+        dt = env.physics_dt
+        self._delay_steps = max(0, int(round(cfg.delay_s / dt)))
+        self._alpha = 1.0 if cfg.lag_s <= 0 else 1.0 - math.exp(-dt / cfg.lag_s)
+        n, j = self.num_envs, self.action_dim
+        self._line = torch.zeros(n, self._delay_steps + 1, j, device=self.device)  # oldest first
+        self._filtered = torch.zeros(n, j, device=self.device)
+        self._needs_init = torch.ones(n, dtype=torch.bool, device=self.device)
+
+    def _initialize(self, env_ids: torch.Tensor):
+        """Start the delay line and filter at the measured joints (after any reset or state write)."""
+        q = self._asset.data.joint_pos[env_ids][:, self._joint_ids]
+        self._line[env_ids] = q.unsqueeze(1)
+        self._filtered[env_ids] = q
+        self._needs_init[env_ids] = False
+
+    def last_command(self, env_id: int) -> torch.Tensor:
+        """The most recent command for one env (the measured joints right after a reset): an IK seed."""
+        if self._needs_init[env_id]:
+            return self._asset.data.joint_pos[env_id, self._joint_ids].clone()
+        return self._line[env_id, -1].clone()
+
+    def process_actions(self, actions: torch.Tensor):
+        super().process_actions(actions)
+        if self._needs_init.any():
+            self._initialize(self._needs_init.nonzero().squeeze(-1))
+
+    def apply_actions(self):
+        self._line = torch.cat([self._line[:, 1:], self.processed_actions.unsqueeze(1)], dim=1)
+        self._filtered = self._filtered + self._alpha * (self._line[:, 0] - self._filtered)
+        self._asset.set_joint_position_target(self._filtered, joint_ids=self._joint_ids)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        super().reset(env_ids)
+        self._needs_init[slice(None) if env_ids is None else env_ids] = True
+
+
+@configclass
+class ServoJointPositionActionCfg(JointPositionActionCfg):
+    class_type: type = ServoJointPositionAction
+    use_default_offset: bool = False
+
+    delay_s: float = 0.0
+    """Delay from command to the start of the motion (s)."""
+    lag_s: float = 0.0
+    """First-order time constant of the tracking (s)."""

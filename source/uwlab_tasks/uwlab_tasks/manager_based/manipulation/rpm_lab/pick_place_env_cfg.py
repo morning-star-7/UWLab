@@ -5,11 +5,11 @@
 
 """Lightning single-arm pick-and-place on the RPM Lab twin, set up for scripted demos and Isaac Lab Mimic.
 
-A 45 mm cube goes onto a 100 mm plate; Thunder stays parked at its home. The arm takes absolute grasp-point (TCP)
-poses in Lightning's base_link frame (differential IK) at 20 Hz, the rate of the real datasets; the gripper takes a
-binary open (>= 0) / close (< 0) command on finger_joint. The IK uses an exact geometric Jacobian (``actions.py``);
-Isaac Lab's own IK term gets the offset grasp point's Jacobian wrong on these arms. Mimic splits a demo into "grasp the cube" (relative to the
-cube) and "place on the plate" (relative to the plate).
+A 45 mm cube goes onto a 100 mm plate; Thunder stays parked at its home. The action matches the real datasets: absolute
+joint commands for the six arm joints plus a gripper command in [0 open, 1 closed], at 20 Hz. The arm executes them
+like the real controller's servoJ (delay and lag fitted on recordings, ``actions.ServoJointPositionAction``). Mimic
+works in grasp-point poses; ``lightning_mimic_env.py`` converts them to joint commands with IK on the arm's factory
+calibration. Mimic splits a demo into "grasp the cube" (relative to the cube) and "place on the plate".
 """
 
 from __future__ import annotations
@@ -22,9 +22,8 @@ import yaml
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
-from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg, mdp
-from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg
+from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
 from isaaclab.envs.mimic_env_cfg import MimicEnvCfg, SubTaskConfig
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -34,7 +33,8 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
 from . import scene_cfg as lab
-from .actions import GeometricJacobianDiffIKActionCfg
+from .actions import ServoJointPositionActionCfg
+from .sensors import reattach_mounted_cameras_event
 
 ARM_JOINTS = [
     "shoulder_pan_joint",
@@ -44,17 +44,18 @@ ARM_JOINTS = [
     "wrist_2_joint",
     "wrist_3_joint",
 ]
-ARM_LINKS = ["shoulder_link", "upper_arm_link", "forearm_link", "wrist_1_link", "wrist_2_link", "wrist_3_link"]
+INSTRUCTION = "put the red cube on the green plate"
+
 GRIPPER_BODY = "robotiq_base_link"
 FINGER_JOINT = "finger_joint"
-FINGER_CLOSED_TARGET = 0.7  # rad; the fingers meet at 0.82
-ARM_STIFFNESS = (4000.0, 4000.0, 2500.0, 600.0, 600.0, 400.0)  # joint PD that tracks the IK targets
+FINGER_CLOSED = 0.82  # rad, finger_joint's upper limit: the fingertips meet
+ARM_STIFFNESS = (4000.0, 4000.0, 2500.0, 600.0, 600.0, 400.0)  # joint PD that tracks the servo model's output
 ARM_DAMPING = (250.0, 250.0, 150.0, 25.0, 25.0, 15.0)
 
 CUBE_SIZE = 0.045
 PLATE_SIZE = (0.10, 0.10, 0.01)
-CUBE_POS = (-0.30, -0.16, lab.TABLE_TOP_Z + 0.5 * CUBE_SIZE + 0.001)
-PLATE_POS = (-0.13, -0.30, lab.TABLE_TOP_Z + 0.5 * PLATE_SIZE[2])
+CUBE_POS = (-0.30, -0.16, lab.WORK_SURFACE_Z + 0.5 * CUBE_SIZE + 0.001)
+PLATE_POS = (-0.13, -0.30, lab.WORK_SURFACE_Z + 0.5 * PLATE_SIZE[2])
 """Nominal object positions (world). Lightning's real teleop workspace spans x -0.47..0.09, y -0.41..0.06; these keep
 both objects clear of the parked Thunder hand (x 0.07, y -0.06) and of each other under the reset ranges below."""
 
@@ -139,7 +140,7 @@ def object_placed(
 
 
 def object_fell(env: ManagerBasedRLEnv, object_cfg: SceneEntityCfg = SceneEntityCfg("cube")) -> torch.Tensor:
-    return object_pos(env, object_cfg)[:, 2] < lab.TABLE_TOP_Z - 0.05
+    return object_pos(env, object_cfg)[:, 2] < lab.WORK_SURFACE_Z - 0.05
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -175,22 +176,21 @@ class LightningPickPlaceSceneCfg(lab.RpmLabDualArmSceneCfg):
 
 @configclass
 class ActionsCfg:
-    arm = GeometricJacobianDiffIKActionCfg(
+    arm = ServoJointPositionActionCfg(
         asset_name="lightning",
         joint_names=ARM_JOINTS,
-        joint_child_bodies=ARM_LINKS,
-        body_name=GRIPPER_BODY,
-        body_offset=GeometricJacobianDiffIKActionCfg.OffsetCfg(pos=TCP_POS, rot=TCP_QUAT),
-        controller=DifferentialIKControllerCfg(
-            command_type="pose", use_relative_mode=False, ik_method="dls", ik_params={"lambda_val": 0.05}
-        ),
+        preserve_order=True,
+        delay_s=lab.SERVOJ_MODEL["lightning"][0],
+        lag_s=lab.SERVOJ_MODEL["lightning"][1],
     )
-    gripper = BinaryJointPositionActionCfg(
+    gripper = JointPositionActionCfg(
         asset_name="lightning",
         joint_names=[FINGER_JOINT],
-        open_command_expr={FINGER_JOINT: 0.0},
-        close_command_expr={FINGER_JOINT: FINGER_CLOSED_TARGET},
+        scale=FINGER_CLOSED,
+        use_default_offset=False,
+        clip={FINGER_JOINT: (0.0, FINGER_CLOSED)},
     )
+    """Gripper command in [0 open, 1 closed] (the real datasets' cmd_gripper), linear in finger_joint."""
 
 
 @configclass
@@ -226,6 +226,8 @@ class ObservationsCfg:
 class EventCfg:
     # Writes every articulation's default root pose too (the robot USDs author base_link turned 180 deg).
     reset_scene = EventTerm(func=mdp.reset_scene_to_default, mode="reset", params={"reset_joint_targets": True})
+    # Keeps wrist cameras (if a camera scene is used) on their links; see sensors.py.
+    reattach_cameras = EventTerm(func=reattach_mounted_cameras_event, mode="reset")
     place_cube = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
