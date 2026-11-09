@@ -318,7 +318,7 @@ class LightningCookFishMimicEnvCfg(LightningCookFishEnvCfg, MimicEnvCfg):
         super().__post_init__()
         self.datagen_config.name = "lightning_cook_fish"
         self.datagen_config.generation_guarantee = True
-        self.datagen_config.generation_keep_failed = False
+        self.datagen_config.generation_keep_failed = True  # failed attempts go to <output>_failed.hdf5, for diagnosis
         self.datagen_config.generation_num_trials = 10
         self.datagen_config.generation_select_src_per_subtask = True
         self.datagen_config.generation_transform_first_robot_pose = False

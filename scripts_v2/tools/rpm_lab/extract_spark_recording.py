@@ -18,6 +18,7 @@ Output arrays, per arm present (``thunder``, ``lightning``), times in seconds fr
   measured opening, 0 open .. 1 closed;
 * ``<arm>.cmd_t``, ``<arm>.cmd_q``, ``<arm>.cmd_gripper``: the teleop commands sent with servoJ (only while teleop
   is active);
+* ``<arm>.wrench_t``, ``<arm>.wrench`` (N, 6): the controller's TCP force/torque (raw bags only);
 * ``teleop_active.t``, ``teleop_active.value``; ``meta`` (JSON: source, arms, task, start time);
 * with ``--images``: ``image.<camera>.t`` and ``image.<camera>.rgb`` (M, H, W, 3), e.g. ``lightning_wrist``; with
   ``--depth`` also ``depth.<camera>.t`` and ``depth.<camera>.raw`` (M, H, W, uint16; meters = raw * meta
@@ -107,6 +108,9 @@ def read_raw_episode(directory: str, image_period: float | None, depth: bool) ->
                 elif schema.name == "geometry_msgs/msg/PoseStamped":
                     p, q = msg.pose.position, msg.pose.orientation
                     rows[topic].append([t, p.x, p.y, p.z, q.w, q.x, q.y, q.z])
+                elif schema.name == "geometry_msgs/msg/WrenchStamped":
+                    f_, t_ = msg.wrench.force, msg.wrench.torque
+                    rows[topic].append([t, f_.x, f_.y, f_.z, t_.x, t_.y, t_.z])
                 elif schema.name == "std_msgs/msg/Bool":
                     rows[topic].append([t, float(msg.data)])
     rows = {k: np.asarray(v, dtype=np.float64) for k, v in rows.items()}
@@ -128,6 +132,9 @@ def read_raw_episode(directory: str, image_period: float | None, depth: bool) ->
         out[f"{arm}.cmd_q"] = cmd[:, 1:7]
         out[f"{arm}.cmd_gripper_t"] = (cmd_g[:, 0] - t0) * 1e-9
         out[f"{arm}.cmd_gripper"] = cmd_g[:, 1]
+        wrench = rows.get(f"/spark/{arm}/robot/tcp_wrench", np.zeros((0, 7)))
+        out[f"{arm}.wrench_t"] = (wrench[:, 0] - t0) * 1e-9
+        out[f"{arm}.wrench"] = wrench[:, 1:7]
     active = rows.get("/spark/session/teleop_active", np.zeros((0, 2)))
     out["teleop_active.t"] = (active[:, 0] - t0) * 1e-9
     out["teleop_active.value"] = active[:, 1]

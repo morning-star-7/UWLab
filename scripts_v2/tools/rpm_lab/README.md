@@ -15,6 +15,7 @@ real recordings copied from the lab robot PC (Zeus) in `/data/cui00191/rpm_lab_r
 | `scripted_demos.py` | Isaac Sim | Records scripted source demos for Mimic (Isaac Lab demo HDF5) on the pick-and-place or cook_fish task. |
 | `mimic.py` | Isaac Sim | Runs Isaac Lab Mimic's `annotate` / `generate` / `replay` scripts on the RPM Lab tasks. |
 | `render_mimic_dataset.py` | Isaac Sim | Renders a demo HDF5 through scene_1 and the wrist D405 in the real cameras' models; writes per-episode `.npz` with the real state/action schema. |
+| `convert_raw_episodes.py` | Python with `mcap mcap-ros2-support` (e.g. the IWS venv) | Converts raw real episodes (bags) into the same 20 Hz episode format as the sim render (`cotrain_schema.py`), for the same LeRobot export. |
 | `export_lerobot_dataset.py` | lerobot 0.5.2 venv | Writes those episodes as a LeRobot v3 dataset with the real feature names (h264, 20 fps). |
 | `world_model/build_iws_dataset.py` | IWS venv | Mixes real and sim LeRobot datasets into an Interactive World Simulator training set. |
 | `world_model/train_iws.py` | IWS venv | Trains the Interactive World Simulator (three stages) on such a set. |
@@ -77,6 +78,21 @@ The datasets keep full sim states, so they can be re-rendered whenever the camer
 python scripts_v2/tools/rpm_lab/render_mimic_dataset.py --headless --num_envs 8 --dataset $M/generated_50.hdf5 --out $M/render
 /data/cui00191/rpm_lab_envs/lerobot/bin/python scripts_v2/tools/rpm_lab/export_lerobot_dataset.py \
     --frames $M/render --root $M/lerobot --repo_id rpm_lab/sim_lightning_cook_fish
+```
+
+Real episodes go through the same export: `convert_raw_episodes.py` resamples the raw bags at 20 Hz over the span where
+teleop and both cameras are live (images: newest frame at or before each tick, 17 ms behind on average; action: newest
+teleop command; state: measured joints, flange pose, gripper and TCP wrench interpolated), so real and sim LeRobot
+datasets are interchangeable. The 50 cook_fish episodes of 2026-10-28 (`/data/cui00191/raw_episodes`, 92 GB of bags)
+became `/data/cui00191/WM-cotrain/lerobot/real_cook_fish` (16,580 frames, 131 MB). A 30 fps, 224 px letterboxed copy
+of them (`/data/cui00191/lerobot/local/spark_lightning`, LeRobot v2.1) does not match the sim format.
+
+```bash
+python scripts_v2/tools/rpm_lab/convert_raw_episodes.py --task cook_fish --episodes /data/cui00191/raw_episodes/episode-* \
+    --out /data/cui00191/WM-cotrain/real_frames/cook_fish
+/data/cui00191/rpm_lab_envs/lerobot/bin/python scripts_v2/tools/rpm_lab/export_lerobot_dataset.py \
+    --frames /data/cui00191/WM-cotrain/real_frames/cook_fish --root /data/cui00191/WM-cotrain/lerobot/real_cook_fish \
+    --repo_id rpm_lab/real_lightning_cook_fish
 ```
 
 The render restores each step's sim state, renders scene_1 and the wrist D405, warps the pinhole renders into the real

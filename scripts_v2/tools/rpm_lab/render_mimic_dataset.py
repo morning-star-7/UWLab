@@ -58,18 +58,12 @@ import isaaclab.utils.math as math_utils
 from isaaclab.scene import InteractiveScene
 from isaaclab.sensors import TiledCamera
 
+from cotrain_schema import ACTION_NAMES, STATE_NAMES  # noqa: E402 (script dir on sys.path)
 from uwlab_tasks.manager_based.manipulation.rpm_lab import registry
 from uwlab_tasks.manager_based.manipulation.rpm_lab import scene_cfg as lab
 from uwlab_tasks.manager_based.manipulation.rpm_lab.pick_place_env_cfg import ARM_JOINTS, FINGER_CLOSED, FINGER_JOINT
 from uwlab_tasks.manager_based.manipulation.rpm_lab.sensors import reattach_mounted_cameras
 
-STATE_NAMES = (
-    [f"lightning_joint_pos_{i}" for i in range(1, 7)]
-    + [f"lightning_eef_{k}" for k in ("x", "y", "z", "rx", "ry", "rz")]
-    + ["lightning_gripper_position"]
-    + [f"lightning_ft_{k}" for k in ("fx", "fy", "fz", "tx", "ty", "tz")]
-)
-ACTION_NAMES = [f"lightning_cmd_joint_{i}" for i in range(1, 7)] + ["lightning_cmd_gripper"]
 CAMERA_SIZES = {"scene_1": (lab.L515_WIDTH, lab.L515_HEIGHT), "wrist_1": (lab.D405_WIDTH, lab.D405_HEIGHT)}
 
 
