@@ -22,6 +22,7 @@ wanted). Use the IWS venv::
 """
 
 import argparse
+import glob
 import json
 import os
 import subprocess
@@ -50,7 +51,7 @@ def main():
     parser.add_argument("--stage", type=int, choices=(1, 2, 3), required=True)
     parser.add_argument("--name", required=True, help="Run name (directory under --runs).")
     parser.add_argument("--data", required=True, help="Dataset from build_iws_dataset.py.")
-    parser.add_argument("--runs", default="/data/cui00191/rpm_lab_wm/runs")
+    parser.add_argument("--runs", default="/data/cui00191/WM-cotrain/runs")
     parser.add_argument(
         "--views",
         choices=list(VIEWS_OF_TWO_CAMERA_SET),
@@ -64,6 +65,19 @@ def main():
     parser.add_argument("--val_every", type=int, default=None, help="Validation interval (default 6000 / 30000).")
     parser.add_argument("--ckpt_every", type=int, default=10000)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from the newest checkpoint in the run directory if there is one (full Lightning state: weights, "
+        "optimizer, schedule, step), e.g. for a chain of time-limited cluster jobs.",
+    )
+    parser.add_argument("--max_time", default=None, help="Stop cleanly after this long (Lightning's DD:HH:MM:SS).")
+    parser.add_argument(
+        "--keep_last",
+        type=int,
+        default=None,
+        help="After training, delete all but the newest N checkpoints (resumed runs keep the old ones otherwise).",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Print the command only.")
     parser.add_argument("overrides", nargs="*", help="Extra Hydra overrides, passed through to IWS.")
     args = parser.parse_args()
@@ -81,6 +95,11 @@ def main():
         parser.error(f"stage {args.stage} needs --load_ae (the previous stage's checkpoint)")
     horizon, val_horizon, batch_size, extra = STAGES[args.stage]
     run_dir = os.path.join(args.runs, args.name)
+    resume_from = None
+    if args.resume:
+        checkpoints = sorted(glob.glob(os.path.join(run_dir, "checkpoints", "*.ckpt")), key=os.path.getmtime)
+        resume_from = checkpoints[-1] if checkpoints else None
+        print(f"Resuming from {resume_from}" if resume_from else "No checkpoint to resume from: starting", flush=True)
     shape_meta = [f"dataset.shape_meta.obs.{key}.shape=[3,{resolution},{resolution}]" for key in cameras]
     if "camera_0_color" not in cameras:
         shape_meta.append("~dataset.shape_meta.obs.camera_0_color")  # IWS's default lists both cameras
@@ -112,9 +131,12 @@ def main():
         f"algorithm.action_dim={ACTION_DIM}",
         f"algorithm.training_stage={args.stage}",
         "wandb.entity=rpm_lab",
+        "wandb.project=WM-cotrain",
         "wandb.mode=offline",
         *extra,
         *(["algorithm.metrics=[]"] if len(obs_keys) > 1 else []),
+        *([f"experiment.training.max_time='{args.max_time}'"] if args.max_time else []),
+        *([f"load='{resume_from}'"] if resume_from else []),
         # quoted: Lightning checkpoint names contain "=", which Hydra's override grammar rejects unquoted
         *([f"algorithm.load_ae='{os.path.abspath(args.load_ae)}'"] if args.load_ae else []),
         *args.overrides,
@@ -124,7 +146,16 @@ def main():
         return
     os.makedirs(run_dir, exist_ok=True)
     env = dict(os.environ, WANDB_DIR=run_dir, PYTHONUNBUFFERED="1")
-    sys.exit(subprocess.call(command, cwd=IWS, env=env))
+    if resume_from:
+        # Torch >= 2.6 loads weights only by default; IWS's Lightning checkpoints (our own) also hold OmegaConf objects.
+        env["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+    code = subprocess.call(command, cwd=IWS, env=env)
+    if args.keep_last:
+        checkpoints = sorted(glob.glob(os.path.join(run_dir, "checkpoints", "*.ckpt")), key=os.path.getmtime)
+        for path in checkpoints[: -args.keep_last]:
+            os.remove(path)
+            print(f"Deleted old checkpoint {path}", flush=True)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

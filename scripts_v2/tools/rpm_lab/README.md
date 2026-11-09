@@ -110,7 +110,7 @@ tools in `world_model/`:
   stored under that key (the manifest records which one).
 - `train_iws.py` runs IWS's `main.py` for its three stages (1 autoencoder, 2 latent dynamics, 3 decoder fine-tuning,
   each from the previous checkpoint) on the dataset's camera(s) with Lightning's 7-dim action; runs, checkpoints and
-  offline wandb logs go to `/data/cui00191/rpm_lab_wm/runs/<name>`. IWS's released models are one per camera; on a
+  offline wandb logs go to `/data/cui00191/WM-cotrain/runs/<name>`. IWS's released models are one per camera; on a
   `both` dataset `--views both` stacks the views in one model, whose validation skips FVD (I3D takes 3 channels).
 
 ```bash
@@ -123,7 +123,7 @@ uv pip install --python /data/cui00191/rpm_lab_envs/iws/bin/python -r $D/require
     --index-strategy unsafe-best-match
 uv pip install --python /data/cui00191/rpm_lab_envs/iws/bin/python --no-deps -e third_party/interactive_world_sim
 
-P=/data/cui00191/rpm_lab_envs/iws/bin/python W=/data/cui00191/rpm_lab_wm
+P=/data/cui00191/rpm_lab_envs/iws/bin/python W=/data/cui00191/WM-cotrain
 $P $D/build_iws_dataset.py --out $W/data/cook_fish_r40_s500 --real $REAL --sim $SIM --sim_episodes 500 --val_real 10
 $P $D/train_iws.py --stage 1 --name cf_ae --data $W/data/cook_fish_r40_s500
 $P $D/train_iws.py --stage 2 --name cf_dyn --data $W/data/cook_fish_r40_s500 --load_ae $W/runs/cf_ae/checkpoints/<ckpt>
@@ -147,6 +147,48 @@ camera at 128 px on an otherwise idle A6000 (48 GB), 60 steps each:
 | | 16 (IWS README, on an H200) | out of memory | | |
 
 The GPU saturates early: past batch 4 the samples per second barely grow. `train_iws.py` defaults to 1 / 4 / 8.
+
+## Training on MSI (Agate)
+
+`msi/` runs the world-model training on MSI's `msigpu` partition (A100 / H100, not preemptible, 24 h per job), after
+the framework MSI users in the lab already use (thin Apptainer container, venv on project storage, one pinned commit
+per job, one git worktree per run). Isaac Sim rendering stays on the workstation (MSI's A100/H100 have no RT cores).
+
+| File | Where | What it does |
+|---|---|---|
+| `msi/msi.env` | both | Site settings: ssh alias, Slurm account (PI group), MSI project directory, local ledger. |
+| `msi/rpm_lab_iws.def` | MSI | Apptainer definition: CUDA 12.6 devel, Python 3.11 (deadsnakes), uv. No Python packages. |
+| `msi/setup_msi.sh` | MSI login node | One time: clone the repo + IWS submodule, build the sandbox, create `venv-iws` through it, import check. |
+| `msi/msi_iws.slurm` | MSI job | One training stage: checks the commit pin, makes the run's worktree under `flock` (IWS submodule cloned from the main checkout, no network), checks the dataset, runs `train_iws.py --resume` in the sandbox. Stops 30 min before the time limit and keeps the newest two checkpoints; `--requeue` and chained jobs continue the run. |
+| `msi/msi_submit.py` | workstation | Submits a stage at the pushed tip of the branch (launcher text read at that commit; msigpu only; sandbox, venv, dataset and queue checked over ssh); `--chain N` for stages longer than 24 h; appends to the job ledger. |
+| `msi/msi_sync.sh` | workstation | `push-data <dataset dir>`, `pull-run <run>` (checkpoints, config, logs; sha256 checked), `status`. |
+
+One-time setup:
+
+1. `~/.ssh/config` on the workstation has `Host msi` with a ControlMaster (`ControlPath ~/.ssh/sockets/%r@%h:%p`,
+   `ControlPersist 4h`). Open the connection by hand (password + Duo): `ssh -fN msi`; the tools only reuse it
+   (`ssh -O check msi`).
+2. Fill `MSI_ACCOUNT` (PI group) and `MSI_PROJECT_DIR` (`/projects/standard/<group>/shared/<user>/WM-cotrain`) in
+   `msi/msi.env`.
+3. `ssh msi "bash -s -- <MSI_PROJECT_DIR>" < scripts_v2/tools/rpm_lab/msi/setup_msi.sh`
+
+Each experiment (push the code first: jobs train the branch tip on origin):
+
+```bash
+M=scripts_v2/tools/rpm_lab/msi
+$M/msi_sync.sh push-data /data/cui00191/WM-cotrain/data/cook_fish_r40_s500
+python $M/msi_submit.py --run cf_ae --stage 1 --dataset cook_fish_r40_s500
+python $M/msi_submit.py --run cf_dyn --stage 2 --dataset cook_fish_r40_s500 --load_ae_run cf_ae \
+    --dependency <stage-1 job> --chain 2
+$M/msi_sync.sh status
+$M/msi_sync.sh pull-run cf_dyn
+```
+
+Checked on the workstation (11/2026; no MSI access yet): the launcher end to end with `apptainer exec` replaced by
+a plain shell (refuses a job without the submit tool's mark; worktrees and the submodule from the local copy; stage 1
+trains; stage 2 starts from stage 1's newest checkpoint; a second job of a run resumes it), and `train_iws.py`
+resume and `--max_time`. Resuming needs `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1` (set by `train_iws.py`): torch >= 2.6
+loads weights only by default and IWS's Lightning checkpoints also hold OmegaConf objects.
 
 ## Checked against the real arms (11/2026)
 

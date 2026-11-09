@@ -1,0 +1,36 @@
+Bootstrap: docker
+From: nvidia/cuda:12.6.3-devel-ubuntu22.04
+
+# Thin OS layer for training the Interactive World Simulator on MSI (Agate). The Python environment is NOT in here:
+# it is a uv venv on the bind-mounted project storage (setup_msi.sh), so dependency changes need no rebuild.
+# Plain -devel base (torch brings its own cuDNN; a smaller image extracts faster on MSI storage).
+# Python 3.11 (IWS's version) comes from the deadsnakes PPA; apt-get update again after adding it.
+
+%labels
+    Purpose RPM Lab world-model (IWS) training sandbox
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends software-properties-common
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl git build-essential pkg-config \
+        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+        python3.11 python3.11-dev python3.11-venv
+    rm -rf /var/lib/apt/lists/*
+    # uv into /usr/local/bin: readable by the unprivileged user that runs the jobs (not /root/.local/bin)
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+    /usr/local/bin/uv --version
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export CUDA_HOME=/usr/local/cuda
+    export PATH="/usr/local/bin:${CUDA_HOME}/bin:${PATH}"
+    export TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0"
+
+%runscript
+    exec /bin/bash "$@"
