@@ -46,6 +46,24 @@ STAGES = {
 }
 
 
+def seconds(duration: str) -> int:
+    days, hours, minutes, secs = (int(x) for x in duration.split(":"))
+    return ((days * 24 + hours) * 60 + minutes) * 60 + secs
+
+
+def duration(total: float) -> str:
+    total = int(total)
+    return f"{total // 86400:02d}:{total % 86400 // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def trained_seconds(checkpoint: str) -> float:
+    """Training time recorded in a checkpoint by Lightning's Timer (max_time), which resumes counting from it."""
+    import torch
+
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)  # our own checkpoint
+    return float(state.get("callbacks", {}).get("Timer", {}).get("time_elapsed", {}).get("train", 0.0))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--stage", type=int, choices=(1, 2, 3), required=True)
@@ -71,7 +89,12 @@ def main():
         help="Continue from the newest checkpoint in the run directory if there is one (full Lightning state: weights, "
         "optimizer, schedule, step), e.g. for a chain of time-limited cluster jobs.",
     )
-    parser.add_argument("--max_time", default=None, help="Stop cleanly after this long (Lightning's DD:HH:MM:SS).")
+    parser.add_argument(
+        "--max_time",
+        default=None,
+        help="Stop cleanly after this much training in this invocation (DD:HH:MM:SS). Lightning's limit counts the "
+        "training time of all resumed sessions, so a resume adds the time already recorded in the checkpoint.",
+    )
     parser.add_argument(
         "--keep_last",
         type=int,
@@ -100,6 +123,11 @@ def main():
         checkpoints = sorted(glob.glob(os.path.join(run_dir, "checkpoints", "*.ckpt")), key=os.path.getmtime)
         resume_from = checkpoints[-1] if checkpoints else None
         print(f"Resuming from {resume_from}" if resume_from else "No checkpoint to resume from: starting", flush=True)
+    max_time = args.max_time
+    if max_time and resume_from:
+        done = trained_seconds(resume_from)
+        max_time = duration(done + seconds(args.max_time))
+        print(f"Already trained {duration(done)}: Lightning max_time {max_time}", flush=True)
     shape_meta = [f"dataset.shape_meta.obs.{key}.shape=[3,{resolution},{resolution}]" for key in cameras]
     if "camera_0_color" not in cameras:
         shape_meta.append("~dataset.shape_meta.obs.camera_0_color")  # IWS's default lists both cameras
@@ -135,7 +163,7 @@ def main():
         "wandb.mode=offline",
         *extra,
         *(["algorithm.metrics=[]"] if len(obs_keys) > 1 else []),
-        *([f"experiment.training.max_time='{args.max_time}'"] if args.max_time else []),
+        *([f"experiment.training.max_time='{max_time}'"] if max_time else []),
         *([f"load='{resume_from}'"] if resume_from else []),
         # quoted: Lightning checkpoint names contain "=", which Hydra's override grammar rejects unquoted
         *([f"algorithm.load_ae='{os.path.abspath(args.load_ae)}'"] if args.load_ae else []),
