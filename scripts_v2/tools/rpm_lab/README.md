@@ -202,9 +202,9 @@ $M/msi_sync.sh pull-run cf_dyn
 
 Online wandb: jobs log offline on MSI; `msi_sync.sh wandb` pulls the logs and uploads them with the workstation's own
 `wandb login` to `WANDB_ENTITY/WANDB_PROJECT` (`research-group/WM-cotrain`), resuming each run where the last upload
-stopped. It uses a separate venv with a current wandb (`/data/cui00191/rpm_lab_envs/wandb_sync`): IWS's pinned 0.18
+stopped, with one `wandb beta sync --live` per run tailing the mirrored log (`rsync --append`), so runs show as running and finish when their job ends; a plain `wandb sync` of an unfinished log marks the run failed. It uses a separate venv with a current wandb (`/data/cui00191/rpm_lab_envs/wandb_sync`): IWS's pinned 0.18
 client can no longer talk to the wandb server and fails silently. Keep it running while jobs train, detached:
-`setsid nohup scripts_v2/tools/rpm_lab/msi/msi_sync.sh wandb-watch 15 > /data/cui00191/WM-cotrain/logs/wandb_sync.log 2>&1 &`
+`setsid nohup scripts_v2/tools/rpm_lab/msi/msi_sync.sh wandb-watch 5 > /data/cui00191/WM-cotrain/logs/wandb_sync.log 2>&1 &`
 (it needs the `ssh -fN msi` connection; MSI compute nodes do reach wandb.ai, so logging online from the jobs would
 also work once a key is on MSI).
 
