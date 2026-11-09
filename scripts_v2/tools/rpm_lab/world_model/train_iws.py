@@ -5,7 +5,7 @@
 
 """Train an Interactive World Simulator (``third_party/interactive_world_sim``) on an RPM Lab dataset.
 
-Runs IWS's own ``main.py`` with the RPM Lab settings: the dataset's camera(s) and resolution (from its
+Runs IWS's own ``main.py`` (through ``iws_main.py``, which adds runtime fixes) with the RPM Lab settings: the dataset's camera(s) and resolution (from its
 ``manifest.json``), Lightning's 7-dim action, and the three training stages of the IWS README:
 
 1. autoencoder (encoder + consistency decoder): reconstruction should be near perfect before stage 2;
@@ -133,7 +133,8 @@ def main():
         shape_meta.append("~dataset.shape_meta.obs.camera_0_color")  # IWS's default lists both cameras
     command = [
         sys.executable,
-        os.path.join(IWS, "main.py"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "iws_main.py"),  # IWS's main.py + runtime fixes
+        IWS,
         f"+name={args.name}",
         f"hydra.run.dir={run_dir}",
         "algorithm=latent_world_model",
