@@ -16,6 +16,8 @@ real recordings copied from the lab robot PC (Zeus) in `/data/cui00191/rpm_lab_r
 | `mimic.py` | Isaac Sim | Runs Isaac Lab Mimic's `annotate` / `generate` / `replay` scripts on the RPM Lab tasks. |
 | `render_mimic_dataset.py` | Isaac Sim | Renders a demo HDF5 through scene_1 and the wrist D405 in the real cameras' models; writes per-episode `.npz` with the real state/action schema. |
 | `export_lerobot_dataset.py` | lerobot 0.5.2 venv | Writes those episodes as a LeRobot v3 dataset with the real feature names (h264, 20 fps). |
+| `world_model/build_iws_dataset.py` | IWS venv | Mixes real and sim LeRobot datasets into an Interactive World Simulator training set. |
+| `world_model/train_iws.py` | IWS venv | Trains the Interactive World Simulator (three stages) on such a set. |
 
 Isaac Sim on this server (no personal env): `PATH=/data/kanth042/envs/uwlab-isaac51/bin:$PATH OMNI_KIT_ACCEPT_EULA=YES
 PYTHONPATH=$PWD/source/uwlab:$PWD/source/uwlab_assets:$PWD/source/uwlab_tasks:$PWD/source/uwlab_rl python ... --headless`.
@@ -93,6 +95,58 @@ link poses only to Fabric), so if the arm has moved by then, as after a task env
 fixed wrong offset from its link and stops following it. `rpm_lab/sensors.py` re-attaches mounted cameras (writes their
 authored local transform back into Fabric); the tasks run it as a reset event and the tools call it after
 `sim.reset()`. Preview of three generated demos: `/data/cui00191/rpm_lab_mimic/generated_100_preview.mp4`.
+
+## World model (Interactive World Simulator)
+
+`third_party/interactive_world_sim` (git submodule, MIT; Wang et al., RSS 2026: latent consistency-model world model,
+trained from scratch, fast enough for closed-loop policy evaluation) is trained unchanged on RPM Lab data through two
+tools in `world_model/`:
+
+- `build_iws_dataset.py` mixes real and sim LeRobot datasets into IWS's training cache (`{train,val}/cache*.zarr.zip`):
+  the camera images (`--cameras`, default `scene`: scene_1 only, for fast iteration; `wrist`; `both`), square
+  center-cropped and resized (`--resolution`), the 7-dim joint-command action, a per-step real/sim `domain` array,
+  and `manifest.json`. Validation holds out real episodes (`--val_real`). With the cache present, IWS's
+  ALOHA-specific conversion never runs. IWS names its cache after the `camera_1_color` key, so a single camera is
+  stored under that key (the manifest records which one).
+- `train_iws.py` runs IWS's `main.py` for its three stages (1 autoencoder, 2 latent dynamics, 3 decoder fine-tuning,
+  each from the previous checkpoint) on the dataset's camera(s) with Lightning's 7-dim action; runs, checkpoints and
+  offline wandb logs go to `/data/cui00191/rpm_lab_wm/runs/<name>`. IWS's released models are one per camera; on a
+  `both` dataset `--views both` stacks the views in one model, whose validation skips FVD (I3D takes 3 channels).
+
+```bash
+# environment (once): plain uv venv, no conda
+export UV_CACHE_DIR=/data/cui00191/rpm_lab_envs/uv_cache UV_PYTHON_INSTALL_DIR=/data/cui00191/rpm_lab_envs/uv_python
+D=scripts_v2/tools/rpm_lab/world_model
+uv venv --python 3.11 /data/cui00191/rpm_lab_envs/iws
+uv pip install --python /data/cui00191/rpm_lab_envs/iws/bin/python -r $D/requirements.txt \
+    --build-constraint $D/build_constraints.txt --extra-index-url https://download.pytorch.org/whl/cu126 \
+    --index-strategy unsafe-best-match
+uv pip install --python /data/cui00191/rpm_lab_envs/iws/bin/python --no-deps -e third_party/interactive_world_sim
+
+P=/data/cui00191/rpm_lab_envs/iws/bin/python W=/data/cui00191/rpm_lab_wm
+$P $D/build_iws_dataset.py --out $W/data/cook_fish_r40_s500 --real $REAL --sim $SIM --sim_episodes 500 --val_real 10
+$P $D/train_iws.py --stage 1 --name cf_ae --data $W/data/cook_fish_r40_s500
+$P $D/train_iws.py --stage 2 --name cf_dyn --data $W/data/cook_fish_r40_s500 --load_ae $W/runs/cf_ae/checkpoints/<ckpt>
+$P $D/train_iws.py --stage 3 --name cf_dec --data $W/data/cook_fish_r40_s500 --load_ae $W/runs/cf_dyn/checkpoints/<ckpt>
+```
+
+Checked end to end on 4 sim cook_fish episodes (11/2026): all three stages train, checkpoint and validate (stages 2
+and 3 roll out 200 frames and compute FVD), for one camera and for both stacked. Batch size vs memory and speed, one
+camera at 128 px on an otherwise idle A6000 (48 GB), 60 steps each:
+
+| stage | batch | peak memory | it/s | samples/s |
+|---|---|---|---|---|
+| 1 autoencoder | 1 (IWS README) | 5.2 GB | 3.26 | 3.3 |
+| | 4 | 17.5 GB | 2.28 | 9.1 |
+| | 8 | 34.0 GB | 1.28 | 10.2 |
+| | 16 | out of memory | | |
+| 2 dynamics (10-frame clips) | 4 (IWS README) | 7.2 GB | 2.78 | 11.1 |
+| | 8 | 13.4 GB | 1.52 | 12.2 |
+| | 16 | 26.0 GB | 0.82 | 13.1 |
+| 3 decoder | 8 | 34.0 GB | 1.31 | 10.5 |
+| | 16 (IWS README, on an H200) | out of memory | | |
+
+The GPU saturates early: past batch 4 the samples per second barely grow. `train_iws.py` defaults to 1 / 4 / 8.
 
 ## Checked against the real arms (11/2026)
 
