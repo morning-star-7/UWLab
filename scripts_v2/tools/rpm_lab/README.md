@@ -177,7 +177,7 @@ per job, one git worktree per run). Isaac Sim rendering stays on the workstation
 | `msi/setup_msi.sh` | MSI login node | One time: clone the repo + IWS submodule, build the sandbox, create `venv-iws` through it, import check. |
 | `msi/msi_iws.slurm` | MSI job | One training stage: checks the commit pin, makes the run's worktree under `flock` (IWS submodule cloned from the main checkout, no network), checks the dataset, runs `train_iws.py --resume` in the sandbox. Stops before the time limit (Lightning counts training time across resumed sessions; `train_iws.py` adds the time recorded in the checkpoint) (10% early, 3 to 30 min) and keeps the newest two checkpoints (saved every 2000 steps); `--requeue` and chained jobs continue the run. |
 | `msi/msi_submit.py` | workstation | Submits a stage at the pushed tip of the branch (launcher text read at that commit; msigpu only; sandbox, venv, dataset and queue checked over ssh); `--chain N` for stages longer than 24 h; appends to the job ledger. |
-| `msi/msi_sync.sh` | workstation | `push-data <dataset dir>`, `pull-run <run>` (checkpoints, config, logs; sha256 checked), `status`. |
+| `msi/msi_sync.sh` | workstation | `push-data <dataset dir>`, `pull-run <run>` (checkpoints, config, logs; sha256 checked), `status`, `wandb` / `wandb-watch` (upload the jobs' offline wandb logs to wandb.ai, see below). |
 
 One-time setup:
 
@@ -199,6 +199,14 @@ python $M/msi_submit.py --run cf_dyn --stage 2 --dataset cook_fish_r40_s500 --lo
 $M/msi_sync.sh status
 $M/msi_sync.sh pull-run cf_dyn
 ```
+
+Online wandb: jobs log offline on MSI; `msi_sync.sh wandb` pulls the logs and uploads them with the workstation's own
+`wandb login` to `WANDB_ENTITY/WANDB_PROJECT` (`research-group/WM-cotrain`), resuming each run where the last upload
+stopped. It uses a separate venv with a current wandb (`/data/cui00191/rpm_lab_envs/wandb_sync`): IWS's pinned 0.18
+client can no longer talk to the wandb server and fails silently. Keep it running while jobs train, detached:
+`setsid nohup scripts_v2/tools/rpm_lab/msi/msi_sync.sh wandb-watch 15 > /data/cui00191/WM-cotrain/logs/wandb_sync.log 2>&1 &`
+(it needs the `ssh -fN msi` connection; MSI compute nodes do reach wandb.ai, so logging online from the jobs would
+also work once a key is on MSI).
 
 Checked on the workstation (11/2026; no MSI access yet): the launcher end to end with `apptainer exec` replaced by
 a plain shell (refuses a job without the submit tool's mark; worktrees and the submodule from the local copy; stage 1
