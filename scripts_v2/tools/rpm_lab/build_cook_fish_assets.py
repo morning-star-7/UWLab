@@ -12,7 +12,7 @@ table (so the rim is about 45 mm up and the handle's top about 35 mm above the l
 squashes under the lid; the rigid one is modeled flat (34 mm) so the lid closes over it.
 
 Collision: the pot is hollow (a bottom plus 24 wall segments); the lid is a disc, a centering lip that drops inside the
-rim, and a raised bar handle the gripper closes on; the fish is the convex hull of its body. Visuals are smooth trimesh
+rim, and a raised bar handle the gripper closes on; the fish is a flat-bottomed elliptic puck (a stable rest, unlike a hull of the ellipsoid). Visuals are smooth trimesh
 meshes. Each object's origin is the center of its bottom face. Runs with any Python that has ``pxr`` and ``trimesh``
 (e.g. the Isaac Sim env's):
 
@@ -230,15 +230,26 @@ def build_fish(path: str):
     tail.apply_transform(trimesh.transformations.rotation_matrix(-math.pi / 2, [0, 1, 0]))
     tail.apply_translation([-FISH_SIZE[0] / 2 * 0.85 + 0.002, 0, FISH_SIZE[2] / 2])
     _mesh(stage, "/Fish/visuals/body", trimesh.util.concatenate([body, tail]), plush)
-    # Collision: the convex hull of the body (the tail is visual only).
+    # Collision: a flat-bottomed elliptic puck with rounded edges (the tail is visual only). 60 vertices: PhysX
+    # simplifies convex hulls to at most 64, and the simplified hull of the visual ellipsoid rested on a facet 20 deg
+    # off level, so the fish lay tilted, rolled over easily and Mimic carried the tilt into its grasps.
+    a, b, h = FISH_SIZE[0] / 2 * 0.85, FISH_SIZE[1] / 2, FISH_SIZE[2]
+    angles = np.linspace(0, 2 * math.pi, 12, endpoint=False)
+    points = [
+        [scale * a * math.cos(t), scale * b * math.sin(t), z]
+        for z, scale in ((0.0, 0.7), (0.15 * h, 0.95), (0.5 * h, 1.0), (0.85 * h, 0.95), (h, 0.7))
+        for t in angles
+    ]
+    puck = trimesh.convex.convex_hull(np.array(points))
     hull = UsdGeom.Mesh.Define(stage, "/Fish/collisions/body")
-    hull.CreatePointsAttr([Gf.Vec3f(*map(float, v)) for v in body.vertices])
-    hull.CreateFaceVertexCountsAttr([3] * len(body.faces))
-    hull.CreateFaceVertexIndicesAttr([int(i) for i in body.faces.flatten()])
+    hull.CreatePointsAttr([Gf.Vec3f(*map(float, v)) for v in puck.vertices])
+    hull.CreateFaceVertexCountsAttr([3] * len(puck.faces))
+    hull.CreateFaceVertexIndicesAttr([int(i) for i in puck.faces.flatten()])
     hull.CreatePurposeAttr("guide")
     UsdPhysics.CollisionAPI.Apply(hull.GetPrim())
     UsdPhysics.MeshCollisionAPI.Apply(hull.GetPrim()).CreateApproximationAttr("convexHull")
     UsdShade.MaterialBindingAPI.Apply(hull.GetPrim()).Bind(plush, materialPurpose="physics")
+    UsdPhysics.MassAPI(root).CreateCenterOfMassAttr(Gf.Vec3f(0.0, 0.0, h / 2))  # geometric center, not computed
     stage.GetRootLayer().Save()
 
 

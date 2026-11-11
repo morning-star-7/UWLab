@@ -87,10 +87,23 @@ FISH_YAW_RANGE = (1.27, 2.37)  # the fish's length across the operators' closing
 OBJECT_X_RANGE = (-0.36, 0.06)
 OBJECT_Y_RANGE = (-0.36, -0.04)
 """Where objects may lie (world): inside Lightning's real teleop workspace, clear of the table's front edge."""
+MAX_REACH = 0.70
+"""Farthest object (fish, lid set aside) from Lightning's base, horizontally (m). The scripted demos and their Mimic
+copies grasp with the gripper pointing straight down, and beyond about 0.73 m the elbow is straight and IK stops short of
+the object. The real fish grasps lie 0.50-0.76 m out, 90 % of them within 0.70 m; the operators reach the far ones with
+the gripper tilted about 12 deg."""
 POT_POS = (-0.07, -0.13, lab.WORK_SURFACE_Z)
 FISH_POS = (-0.22, -0.16, lab.WORK_SURFACE_Z)
 
 GRIPPER_OPEN_BELOW = 0.2  # finger_joint (rad): released
+LIFT_CLEARANCE = 0.02
+"""A held object counts as lifted once its bottom (its origin) is this far above the pot rim, clear of everything on
+the table. The grasp signals wait for it: Mimic starts the next subtask's segment where a signal first rises, so the move
+between two segments (to the next segment's start, transformed with another object) happens in free space instead of
+dragging the object over the table."""
+RETREAT_HEIGHT = 0.12
+"""Grasp-point height above the table at which the open gripper is clear after letting go; the release signals wait
+for it, for the same reason."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -105,20 +118,35 @@ def handle_pos(env: ManagerBasedRLEnv) -> torch.Tensor:
     return lid.data.root_pos_w - env.scene.env_origins + math_utils.quat_apply(lid.data.root_quat_w, offset)
 
 
-def lid_grasped(env: ManagerBasedRLEnv, max_distance: float = 0.025, min_closure: float = 0.4) -> torch.Tensor:
-    """1 while the grasp point is at the handle and the fingers have closed on it (the bar is thin: nearly shut)."""
-    near = (handle_pos(env) - tcp_pos(env)).norm(dim=-1) < max_distance
-    return (near & (finger_angle(env)[:, 0] > min_closure)).float()
+def lightning_base_xy(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """(N, 2) Lightning's base position on the table plane, env frame."""
+    return (env.scene["lightning"].data.root_pos_w - env.scene.env_origins)[:, :2]
 
 
-def fish_grasped(env: ManagerBasedRLEnv, max_distance: float = 0.03, min_closure: float = 0.15) -> torch.Tensor:
-    fish = object_pos(env, SceneEntityCfg("fish")) + torch.tensor([0.0, 0.0, 0.5 * FISH["size"][2]], device=env.device)
-    near = (fish - tcp_pos(env)).norm(dim=-1) < max_distance
-    return (near & (finger_angle(env)[:, 0] > min_closure)).float()
+def _lifted(env: ManagerBasedRLEnv, name: str) -> torch.Tensor:
+    z = object_pos(env, SceneEntityCfg(name))[:, 2]
+    return z > lab.WORK_SURFACE_Z + POT["rim_height"] + LIFT_CLEARANCE
 
 
 def _released(env: ManagerBasedRLEnv) -> torch.Tensor:
     return finger_angle(env)[:, 0] < GRIPPER_OPEN_BELOW
+
+
+def _retreated(env: ManagerBasedRLEnv) -> torch.Tensor:
+    return tcp_pos(env)[:, 2] > lab.WORK_SURFACE_Z + RETREAT_HEIGHT
+
+
+def lid_grasped(env: ManagerBasedRLEnv, max_distance: float = 0.025, min_closure: float = 0.4) -> torch.Tensor:
+    """1 while the fingers hold the handle (the bar is thin: nearly shut) and the lid is lifted (``LIFT_CLEARANCE``)."""
+    near = (handle_pos(env) - tcp_pos(env)).norm(dim=-1) < max_distance
+    return (near & (finger_angle(env)[:, 0] > min_closure) & _lifted(env, "lid")).float()
+
+
+def fish_grasped(env: ManagerBasedRLEnv, max_distance: float = 0.03, min_closure: float = 0.15) -> torch.Tensor:
+    """1 while the fingers hold the fish and it is lifted (``LIFT_CLEARANCE``)."""
+    fish = object_pos(env, SceneEntityCfg("fish")) + torch.tensor([0.0, 0.0, 0.5 * FISH["size"][2]], device=env.device)
+    near = (fish - tcp_pos(env)).norm(dim=-1) < max_distance
+    return (near & (finger_angle(env)[:, 0] > min_closure) & _lifted(env, "fish")).float()
 
 
 def _fish_inside(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -139,15 +167,16 @@ def _lid_on_pot(env: ManagerBasedRLEnv, xy_tolerance: float = 0.012, z_tolerance
 
 
 def lid_off(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """1 once the lid lies on the table beside the pot and the gripper has let go."""
+    """1 once the lid lies on the table beside the pot and the gripper has let go and moved up (``RETREAT_HEIGHT``)."""
     pot, lid = object_pos(env, SceneEntityCfg("pot")), object_pos(env, SceneEntityCfg("lid"))
     beside = (lid[:, :2] - pot[:, :2]).norm(dim=-1) > POT["radius"] + LID["radius"] - 0.01
     on_table = lid[:, 2] < lab.WORK_SURFACE_Z + LID["lip_depth"] + 0.01
-    return (beside & on_table & _released(env)).float()
+    return (beside & on_table & _released(env) & _retreated(env)).float()
 
 
 def fish_in_pot(env: ManagerBasedRLEnv) -> torch.Tensor:
-    return (_fish_inside(env) & _released(env)).float()
+    """1 once the fish lies in the pot and the gripper has let go and moved up (``RETREAT_HEIGHT``)."""
+    return (_fish_inside(env) & _released(env) & _retreated(env)).float()
 
 
 def lid_regrasped(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -164,8 +193,9 @@ def object_fell(env: ManagerBasedRLEnv) -> torch.Tensor:
     return torch.stack([object_pos(env, SceneEntityCfg(n))[:, 2] < low for n in ("pot", "lid", "fish")]).any(dim=0)
 
 
-def reset_cook_fish_layout(env: ManagerBasedRLEnv, env_ids: torch.Tensor, candidates: int = 32):
-    """Pot in ``POT_X/Y_RANGE``, lid seated on it, fish around it (``FISH_DISTANCE``, inside ``OBJECT_X/Y_RANGE``)."""
+def reset_cook_fish_layout(env: ManagerBasedRLEnv, env_ids: torch.Tensor, candidates: int = 64):
+    """Pot in ``POT_X/Y_RANGE``, lid seated on it, fish around it (``FISH_DISTANCE``, inside ``OBJECT_X/Y_RANGE`` and
+    ``MAX_REACH``)."""
     n, device = len(env_ids), env.device
     origins = env.scene.env_origins[env_ids]
 
@@ -179,7 +209,7 @@ def reset_cook_fish_layout(env: ManagerBasedRLEnv, env_ids: torch.Tensor, candid
     z = lab.WORK_SURFACE_Z + 0.0005
     pot = torch.stack([uniform(*POT_X_RANGE), uniform(*POT_Y_RANGE), torch.full((n,), z, device=device)], dim=-1)
     lid = pot + torch.tensor([0.0, 0.0, POT["rim_height"] + 0.0005], device=device)
-    # Fish: the first of several random directions that keeps it inside the object area.
+    # Fish: the first of several random directions that keeps it inside the object area and within reach.
     distance, angle = uniform(*FISH_DISTANCE, n, candidates), uniform(-math.pi, math.pi, n, candidates)
     xy = pot[:, None, :2] + distance[..., None] * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
     inside = (
@@ -187,6 +217,7 @@ def reset_cook_fish_layout(env: ManagerBasedRLEnv, env_ids: torch.Tensor, candid
         & (xy[..., 0] < OBJECT_X_RANGE[1])
         & (xy[..., 1] > OBJECT_Y_RANGE[0])
         & (xy[..., 1] < OBJECT_Y_RANGE[1])
+        & ((xy - lightning_base_xy(env)[env_ids, None]).norm(dim=-1) < MAX_REACH)
     )
     first = inside.int().argmax(dim=1)
     fish = torch.cat([xy[torch.arange(n, device=device), first], pot[:, 2:]], dim=-1)
@@ -321,15 +352,23 @@ class LightningCookFishMimicEnvCfg(LightningCookFishEnvCfg, MimicEnvCfg):
         self.datagen_config.generation_keep_failed = True  # failed attempts go to <output>_failed.hdf5, for diagnosis
         self.datagen_config.generation_num_trials = 10
         self.datagen_config.generation_select_src_per_subtask = True
+        # Mimic only selects again after the first subtask with this set too (data_generator.py: without it, the first
+        # selection holds for the whole episode); with one arm it changes nothing else
+        self.datagen_config.generation_select_src_per_arm = True
         self.datagen_config.generation_transform_first_robot_pose = False
         self.datagen_config.generation_interpolate_from_last_target_pose = True
         self.datagen_config.max_num_failures = 50
         self.datagen_config.seed = 1
+        # source segments Lightning can follow here (lightning_mimic_env.NearestNeighborReachableStrategy): targets
+        # within 0.72 m of the base, where a straight-down grasp at table height still reaches
+        reachable = {"nn_k": 3, "max_reach": 0.72}
         common = dict(
-            selection_strategy="nearest_neighbor_object",
-            selection_strategy_kwargs={"nn_k": 3},
+            selection_strategy="nearest_neighbor_reachable",
+            selection_strategy_kwargs=reachable,
             action_noise=0.003,
-            num_interpolation_steps=5,
+            # 1 s from one segment to the next (up to ~30 cm, in free space: see LIFT_CLEARANCE): with 5 steps the joint
+            # commands jumped up to 0.22 rad per step (4.4 rad/s, beyond the UR5e's 3.14) and a held fish slipped
+            num_interpolation_steps=20,
             num_fixed_steps=0,
             apply_noise_during_interpolation=False,
         )
@@ -337,7 +376,20 @@ class LightningCookFishMimicEnvCfg(LightningCookFishEnvCfg, MimicEnvCfg):
         place = dict(subtask_term_offset_range=(0, 5), **common)
         self.subtask_configs["lightning"] = [
             SubTaskConfig(object_ref="lid", subtask_term_signal="lid_grasped", **grasp),
-            SubTaskConfig(object_ref="pot", subtask_term_signal="lid_off", **place),
+            SubTaskConfig(
+                object_ref="pot",
+                subtask_term_signal="lid_off",
+                **{
+                    **place,
+                    # the set-down spot moves with the pot: keep it off the fish (lid radius + fish half-diagonal +
+                    # 1 cm; v3 set the lid on the fish in 10 of 69 attempts) and in reach of the regrasp
+                    "selection_strategy_kwargs": {
+                        **reachable,
+                        "release_reach": 0.65,
+                        "release_clearance": {"fish": LID["radius"] + 0.5 * math.hypot(*FISH["size"][:2]) + 0.01},
+                    },
+                },
+            ),
             SubTaskConfig(object_ref="fish", subtask_term_signal="fish_grasped", **grasp),
             SubTaskConfig(object_ref="pot", subtask_term_signal="fish_in_pot", **place),
             SubTaskConfig(object_ref="lid", subtask_term_signal="lid_regrasped", **grasp),

@@ -80,11 +80,15 @@ class URKinematics:
         iterations: int = 12,
         damping: float = 0.02,
         max_step: float = 0.3,
+        lower: torch.Tensor | None = None,
+        upper: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Joints (N, 6) that put ``tool`` (N, 4, 4, in tool0) at ``target`` (N, 4, 4, Base frame), from ``q_seed``.
 
-        Damped least squares, which stays on the seed's branch through the wrist singularity. Returns the joints and
-        the remaining position (m) and rotation (rad) errors.
+        Damped least squares, which stays on the seed's branch through the wrist singularity. ``lower``/``upper`` (6,)
+        bound the joints after every step: an elbow bound keeps an out-of-reach target from straightening the elbow
+        and folding it the other way, a branch it does not come back from. Returns the joints and the remaining
+        position (m) and rotation (rad) errors.
         """
         q = q_seed.clone()
         eye = torch.eye(6, device=q.device, dtype=q.dtype)
@@ -98,6 +102,10 @@ class URKinematics:
             err = torch.cat([pos_err, rot_err], dim=-1).unsqueeze(-1)
             dq = jac.transpose(1, 2) @ torch.linalg.solve(jac @ jac.transpose(1, 2) + damping**2 * eye, err)
             q = q + dq.squeeze(-1).clamp(-max_step, max_step)
+            if lower is not None:
+                q = torch.max(q, lower)
+            if upper is not None:
+                q = torch.min(q, upper)
         current = self.fk(q) @ tool
         pos_err = (target[:, :3, 3] - current[:, :3, 3]).norm(dim=-1)
         rot_err = math_utils.axis_angle_from_quat(

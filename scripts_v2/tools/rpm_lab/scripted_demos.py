@@ -164,14 +164,20 @@ def grasp_lid(env, last: np.ndarray) -> list[Waypoint]:
     ]
 
 
+LID_ASIDE_REACH = 0.62
+"""Farthest lid set-down spot from Lightning's base (m), short of ``MAX_REACH``: Mimic re-places the spot with the pot
+(turned up to ~0.8 rad and moved), and the lid has to be grasped there again."""
+
+
 def lid_aside_spot(env) -> np.ndarray:
-    """Where to set the lid down: beside the pot (clear of its handles) inside the object area, as far from the fish
-    as possible."""
+    """Where to set the lid down: beside the pot (clear of its handles) inside the object area and within
+    ``LID_ASIDE_REACH`` of the base, as far from the fish as possible (the spot nearest the base if none is in reach)."""
     task, lab = _cook_fish()
     pot, fish = pose_of(env, "pot"), pose_of(env, "fish")[:3, 3]
+    base = task.lightning_base_xy(env)[0].cpu().numpy()
     pot_x = math.atan2(pot[1, 0], pot[0, 0])  # the handles stick out along the pot's x axis
     margin = task.LID["radius"] - 0.03
-    best, best_d = None, -1.0
+    candidates = []
     for angle in np.radians(np.arange(0, 360, 15)):
         by_handle = abs(math.cos(angle - pot_x)) > math.cos(math.radians(50))
         reach = (task.POT["handle_reach"] if by_handle else task.POT["radius"]) + task.LID["radius"] + 0.02
@@ -180,10 +186,11 @@ def lid_aside_spot(env) -> np.ndarray:
             task.OBJECT_X_RANGE[0] - margin < spot[0] < task.OBJECT_X_RANGE[1] + margin
             and task.OBJECT_Y_RANGE[0] - margin < spot[1] < task.OBJECT_Y_RANGE[1] + margin
         )
-        d = np.linalg.norm(spot - fish[:2])
-        if inside and d > best_d:
-            best, best_d = spot, d
-    return np.array([best[0], best[1], lab.WORK_SURFACE_Z + task.LID["lip_depth"]])
+        if inside:
+            candidates.append((spot, np.linalg.norm(spot - fish[:2]), np.linalg.norm(spot - base)))
+    in_reach = [c for c in candidates if c[2] < LID_ASIDE_REACH]
+    best = max(in_reach, key=lambda c: c[1]) if in_reach else min(candidates, key=lambda c: c[2])
+    return np.array([best[0][0], best[0][1], lab.WORK_SURFACE_Z + task.LID["lip_depth"]])
 
 
 def lid_down_beside(env, last: np.ndarray) -> list[Waypoint]:
