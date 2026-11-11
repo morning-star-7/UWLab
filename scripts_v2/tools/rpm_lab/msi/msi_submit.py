@@ -15,6 +15,12 @@ after the previous one ends (``afterany``) and resuming the run from its newest 
     python scripts_v2/tools/rpm_lab/msi/msi_submit.py --run cf_ae --stage 1 --dataset cook_fish_r40_s500
     python scripts_v2/tools/rpm_lab/msi/msi_submit.py --run cf_dyn --stage 2 --dataset cook_fish_r40_s500 \\
         --load_ae_run cf_ae --chain 2 --dependency <stage-1 job id>
+
+``--eval RUN[,RUN...]`` instead submits one job that validates each run's newest checkpoint with rollouts
+(``train_iws.py --eval``), under the recorded actions and under held actions, into ``runs/<run>_<eval run>_<actions>``:
+
+    python scripts_v2/tools/rpm_lab/msi/msi_submit.py --run cf_real_eval --eval cf_real_dyn,cf_real_dec \\
+        --dataset cook_fish_real --time 02:00:00
 """
 
 import argparse
@@ -66,7 +72,8 @@ def stop_before(time_limit: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--run", required=True, help="Run name (job name, runs/<run>, worktree UWLab-run-<run>).")
-    parser.add_argument("--stage", type=int, choices=(1, 2, 3), required=True)
+    parser.add_argument("--stage", type=int, choices=(1, 2, 3), help="Training stage (not with --eval).")
+    parser.add_argument("--eval", default="", help="Comma-separated runs whose newest checkpoints to validate.")
     parser.add_argument("--dataset", required=True, help="Dataset directory name under data/iws/ on MSI.")
     parser.add_argument("--load_ae_run", default="", help="Previous stage's run (stages 2 and 3).")
     parser.add_argument("--branch", default=None, help="Branch to train (default: the current branch).")
@@ -85,10 +92,16 @@ def main():
     ledger = args.ledger or cfg.get("LEDGER") or os.path.join(HERE, "msi_jobs.jsonl")
     if not account or not project:
         fail(f"set MSI_ACCOUNT and MSI_PROJECT_DIR in {args.env}")
-    for value in (args.run, args.dataset, *([args.load_ae_run] if args.load_ae_run else [])):
+    eval_runs = [r for r in args.eval.split(",") if r]
+    for value in (args.run, args.dataset, *([args.load_ae_run] if args.load_ae_run else []), *eval_runs):
         if not NAME.match(value):
             fail(f"{value!r}: names may only use letters, digits, '_', '.', '-'")
-    if args.stage > 1 and not args.load_ae_run:
+    if eval_runs:
+        if args.stage or args.load_ae_run or args.chain != 1:
+            fail("--eval takes no --stage, --load_ae_run or --chain")
+    elif not args.stage:
+        fail("--stage is required (unless --eval)")
+    elif args.stage > 1 and not args.load_ae_run:
         fail(f"stage {args.stage} needs --load_ae_run")
     if args.time > "24:00:00" or not re.match(r"^\d\d:\d\d:\d\d$", args.time):
         fail("--time must be HH:MM:SS within msigpu's 24:00:00")
@@ -116,7 +129,8 @@ def main():
     checks = (
         f"test -x {project}/venv-iws/bin/python && test -d {project}/iws_sandbox && test -d {project}/UWLab/.git"
         f" || echo MISSING_SETUP; test -f {project}/data/iws/{args.dataset}/manifest.json || echo MISSING_DATA;"
-        f" squeue -h -u $USER -n {args.run} -o %i"
+        + "".join(f" ls {project}/runs/{r}/checkpoints/*.ckpt >/dev/null 2>&1 || echo NO_CKPT_{r};" for r in eval_runs)
+        + f" squeue -h -u $USER -n {args.run} -o %i"
     )
     out = remote(host, checks)
     if out.returncode != 0:
@@ -126,6 +140,9 @@ def main():
         fail(f"no sandbox / venv / repo under {project}: run setup_msi.sh on MSI first")
     if "MISSING_DATA" in lines:
         fail(f"no dataset {args.dataset} on MSI: msi_sync.sh push-data <local dataset dir>")
+    missing = [x[len("NO_CKPT_") :] for x in lines if x.startswith("NO_CKPT_")]
+    if missing:
+        fail(f"no checkpoint on MSI for run(s) {missing}")
     queued = [x for x in lines if x.isdigit()]
     if queued and not args.dependency:
         fail(f"run {args.run} already has queued/running jobs {queued}; chain after them with --dependency")
@@ -137,7 +154,9 @@ def main():
         "RPM_COMMIT": sha,
         "RPM_COMMIT_FROM": f"msi_submit:{sha}",
         "RUN": args.run,
-        "STAGE": str(args.stage),
+        "MODE": "eval" if eval_runs else "train",
+        "EVAL_RUNS": ":".join(eval_runs),
+        "STAGE": str(args.stage or 2),
         "DATASET": args.dataset,
         "LOAD_AE_RUN": args.load_ae_run,
         "MAX_TIME": stop_before(args.time),
@@ -178,6 +197,7 @@ def main():
                 "job": job,
                 "run": args.run,
                 "stage": args.stage,
+                **({"eval": eval_runs} if eval_runs else {}),
                 "dataset": args.dataset,
                 "load_ae_run": args.load_ae_run,
                 "commit": sha,

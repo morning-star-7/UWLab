@@ -12,6 +12,11 @@ Runs IWS's own ``main.py`` (through ``iws_main.py``, which adds runtime fixes) w
 2. latent dynamics, from a stage-1 checkpoint (``--load_ae``);
 3. decoder fine-tuning on noisy latents, from a stage-2 checkpoint.
 
+``--eval <checkpoint>`` instead validates a trained model (any stage's checkpoint) the stage-2 way: from the first frame
+of each validation episode, the dynamics rolls out ``--eval_horizon`` frames under the recorded actions (or, with
+``--eval_actions hold``, under the first action throughout) and the decoder renders them. Besides IWS's metrics it
+writes ``<runs>/<name>/horizon_metrics.json``: PSNR / SSIM by rollout horizon, and the same for repeating the first frame.
+
 Runs go to ``<runs>/<name>/`` (Hydra outputs, checkpoints, offline wandb logs; sync later with ``wandb sync`` if
 wanted). Use the IWS venv::
 
@@ -66,7 +71,7 @@ def trained_seconds(checkpoint: str) -> float:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--stage", type=int, choices=(1, 2, 3), required=True)
+    parser.add_argument("--stage", type=int, choices=(1, 2, 3), help="Training stage (not with --eval).")
     parser.add_argument("--name", required=True, help="Run name (directory under --runs).")
     parser.add_argument("--data", required=True, help="Dataset from build_iws_dataset.py.")
     parser.add_argument("--runs", default="/data/cui00191/WM-cotrain/runs")
@@ -101,6 +106,9 @@ def main():
         default=None,
         help="After training, delete all but the newest N checkpoints (resumed runs keep the old ones otherwise).",
     )
+    parser.add_argument("--eval", default=None, help="Validate this checkpoint (rollouts) instead of training.")
+    parser.add_argument("--eval_actions", choices=("true", "hold"), default="true", help="Rollout actions for --eval.")
+    parser.add_argument("--eval_horizon", type=int, default=340, help="Rollout frames for --eval (17 s at 20 fps).")
     parser.add_argument("--dry_run", action="store_true", help="Print the command only.")
     parser.add_argument("overrides", nargs="*", help="Extra Hydra overrides, passed through to IWS.")
     args = parser.parse_args()
@@ -114,9 +122,15 @@ def main():
         obs_keys = list(cameras)
     else:
         obs_keys = VIEWS_OF_TWO_CAMERA_SET[args.views or "both"]
-    if args.stage > 1 and not args.load_ae:
+    if not args.eval and not args.stage:
+        parser.error("--stage is required (unless --eval)")
+    if args.eval:
+        args.stage, args.load_ae, args.resume, args.max_time = 2, None, False, None  # rollouts: stage 2's validation
+    elif args.stage > 1 and not args.load_ae:
         parser.error(f"stage {args.stage} needs --load_ae (the previous stage's checkpoint)")
     horizon, val_horizon, batch_size, extra = STAGES[args.stage]
+    if args.eval:
+        val_horizon = args.eval_horizon
     run_dir = os.path.join(args.runs, args.name)
     resume_from = None
     if args.resume:
@@ -168,6 +182,7 @@ def main():
         *([f"load='{resume_from}'"] if resume_from else []),
         # quoted: Lightning checkpoint names contain "=", which Hydra's override grammar rejects unquoted
         *([f"algorithm.load_ae='{os.path.abspath(args.load_ae)}'"] if args.load_ae else []),
+        *(["experiment.tasks=[validation]", f"load='{os.path.abspath(args.eval)}'"] if args.eval else []),
         *args.overrides,
     ]
     print(" ".join(command), flush=True)
@@ -175,7 +190,10 @@ def main():
         return
     os.makedirs(run_dir, exist_ok=True)
     env = dict(os.environ, WANDB_DIR=run_dir, PYTHONUNBUFFERED="1")
-    if resume_from:
+    if args.eval:
+        env["IWS_EVAL_ACTIONS"] = args.eval_actions
+        env["IWS_HORIZON_METRICS"] = os.path.join(run_dir, "horizon_metrics.json")
+    if resume_from or args.eval:
         # Torch >= 2.6 loads weights only by default; IWS's Lightning checkpoints (our own) also hold OmegaConf objects.
         env["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
     code = subprocess.call(command, cwd=IWS, env=env)
