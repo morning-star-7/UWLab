@@ -18,7 +18,11 @@ tool writes ``robot.usda``, a small layer that sublayers the source USD unchange
 * any light in the source asset (the builds carry a 1000-unit DomeLight), deactivated: the scene owns the lighting,
   and an asset's light would be added again for every robot and every env;
 * with ``--paint``, the arm's paint: the diffuse color of the named materials (UR5e paint, D405 mount), as fitted to
-  the real arm by ``fit_arm_paint_from_scene_camera.py`` (a name sets all its copies, ``<link>/<name>`` one link's).
+  the real arm by ``fit_arm_paint_from_scene_camera.py`` (a name sets all its copies, ``<link>/<name>`` one link's);
+* with ``--d405_turn``, the wrist D405 and its mount (visual, collider, the optical frame the wrist camera hangs on)
+  turned about the gripper axis: the same mount bolted on the other way round. Lightning's sits 180 deg from the source
+  build's: with the objects laid out as recorded, its sim wrist images match the real ones only turned (unturned they
+  are mirrored), while the fingers, symmetric about that axis, look the same either way.
 
 It writes a matching ``metadata.yaml``. Before writing, it checks that the source calibration reproduces the source
 USD's joint frames and link poses exactly. Run it with any Python that has ``pxr`` (no Isaac Sim app needed):
@@ -29,7 +33,7 @@ USD's joint frames and link poses exactly. Run it with any Python that has ``pxr
         --source_usd $A/sources/124_official_robotiq_d405_20260926_visualfix/robot.usd \\
         --source_calibration $C/thunder_kinematics.yaml --calibration $C/lightning_kinematics.yaml \\
         --robot lightning --out_dir $A/lightning_124_official_robotiq_d405/robot \\
-        --paint $C/lightning_paint_scene1_20261028.json
+        --paint $C/lightning_paint_scene1_20261028.json --d405_turn 180
     python scripts_v2/tools/rpm_lab/build_calibrated_ur5e_usd.py --real_joint_limits \\
         --source_usd $A/sources/189_official_umi_fingertips_20261003_visualfix/robot.usd \\
         --source_calibration $C/thunder_kinematics.yaml --calibration $C/thunder_kinematics.yaml \\
@@ -166,6 +170,45 @@ def sha256(path: str) -> str:
     return h.hexdigest()
 
 
+D405_PRIMS = (
+    "visuals/D405_to_Robotiq_Mount",
+    "visuals/D405_camera_envelope",
+    "collisions/D405_to_Robotiq_Mount",
+    "d405_r2_nominal_optical_frame",
+)
+"""The wrist D405 and its mount, under ``OfficialHand/robotiq_base_link``."""
+
+
+def turn_d405(root, deg: float, gripper_axis) -> dict[str, list[float]]:
+    """Turn ``D405_PRIMS`` by ``deg`` about the gripper axis (``gripper_axis`` in robotiq_base_link, through its origin);
+    returns where each prim's origin ends up in robotiq_base_link."""
+    stage = root.GetStage()
+    rb = stage.GetPrimAtPath(root.GetPath().AppendPath("OfficialHand/robotiq_base_link"))
+    turn = Gf.Matrix4d().SetRotate(Gf.Rotation(Gf.Vec3d(*gripper_axis), deg))  # Gf: row vectors, in rb's frame
+    cache = UsdGeom.XformCache()
+    rb_world = cache.GetLocalToWorldTransform(rb)
+    moved = {}
+    for rel in D405_PRIMS:
+        prim = stage.GetPrimAtPath(rb.GetPath().AppendPath(rel))
+        xf = UsdGeom.Xformable(prim)
+        parent = cache.GetLocalToWorldTransform(prim.GetParent()) * rb_world.GetInverse()  # parent in rb's frame
+        local = xf.GetLocalTransformation() * parent * turn * parent.GetInverse()
+        ops = xf.GetOrderedXformOps()
+        names = [op.GetOpName() for op in ops]
+        if names == ["xformOp:translate", "xformOp:orient"]:
+            ops[0].Set(local.ExtractTranslation())
+            q = local.ExtractRotationQuat()
+            ops[1].Set(type(ops[1].Get())(q.GetReal(), *q.GetImaginary()))
+        elif len(ops) == 1 and ops[0].GetOpType() == UsdGeom.XformOp.TypeTransform:
+            ops[0].Set(local)
+        elif not ops:
+            xf.AddTransformOp(opSuffix="d405_turn").Set(local)
+        else:
+            raise RuntimeError(f"{prim.GetPath()}: unexpected transform ops {names}")
+        moved[rel] = [round(v, 4) for v in (local * parent).ExtractTranslation()]
+    return moved
+
+
 def apply_paint(root, paint: dict) -> dict[str, int]:
     """Set the diffuse color of the materials under ``root`` named in ``paint`` (``<name>``: every copy,
     ``<link>/<name>``: that link's copy); returns the shaders set per entry."""
@@ -188,6 +231,24 @@ def apply_paint(root, paint: dict) -> dict[str, int]:
     return painted
 
 
+def apply_appearance(root, layer, args, gripper_axis) -> dict:
+    """``--paint`` and ``--d405_turn`` on the layer being written; returns their ``metadata.yaml`` entries.
+    ``gripper_axis``: the grasp point in robotiq_base_link (the asset's gripper_offset), on the gripper axis."""
+    entries = {}
+    if args.paint:
+        with open(args.paint) as f:
+            paint = json.load(f)["materials"]
+        print(f"Painted (shaders per entry): {apply_paint(root, paint)}")
+        layer.customLayerData = {**layer.customLayerData, "rpm_lab:paint": os.path.abspath(args.paint)}
+        entries["paint"] = {"source": os.path.abspath(args.paint), "diffuse_color": paint}
+    if args.d405_turn:
+        moved = turn_d405(root, args.d405_turn, gripper_axis)
+        print(f"D405 turned {args.d405_turn} deg (origins in robotiq_base_link): {moved}")
+        layer.customLayerData = {**layer.customLayerData, "rpm_lab:d405_turn_deg": args.d405_turn}
+        entries["d405_turn_deg"] = args.d405_turn
+    return entries
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source_usd", required=True)
@@ -197,6 +258,9 @@ def main():
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--real_joint_limits", action="store_true", help="Set the arm joint limits to the UR5e's.")
     parser.add_argument("--paint", help="Paint JSON (fit_arm_paint_from_scene_camera.py): material -> diffuse color.")
+    parser.add_argument(
+        "--d405_turn", type=float, default=0.0, help="Turn the D405 mount about the gripper axis (deg)."
+    )
     args = parser.parse_args()
 
     source_usd = os.path.abspath(args.source_usd)
@@ -306,12 +370,7 @@ def main():
         if prim.HasAPI(UsdLux.LightAPI):
             prim.SetActive(False)
             print(f"Deactivated the asset's light {prim.GetPath()}")
-    paint = {}
-    if args.paint:
-        with open(args.paint) as f:
-            paint = json.load(f)["materials"]
-        print(f"Painted (shaders per entry): {apply_paint(r, paint)}")
-        layer.customLayerData = {**layer.customLayerData, "rpm_lab:paint": os.path.abspath(args.paint)}
+    appearance = apply_appearance(r, layer, args, gripper_axis=metadata["gripper_offset"]["pos"])
     layer.Save()
 
     # 4) Re-open and check the result against the target calibration.
@@ -342,8 +401,7 @@ def main():
         "base_asset": source_usd,
         "base_asset_calibration": src_cal["hash"],
     }
-    if paint:
-        metadata["paint"] = {"source": os.path.abspath(args.paint), "diffuse_color": paint}
+    metadata.update(appearance)
     metadata["calibrated_joints"] = {
         "xyz": [new_cal[e][:3] for _, e, _, _ in ARM],
         "rpy": [new_cal[e][3:] for _, e, _, _ in ARM],

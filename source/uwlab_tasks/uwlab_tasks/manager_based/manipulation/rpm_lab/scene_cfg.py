@@ -86,7 +86,10 @@ visual-placement fix as Thunder's R189 ``assets_visualfix``, physics unchanged).
 Relative to wrist_3_link, its whole hand (D405 mount, camera, optical frame, flange adapter, gripper) matches Thunder's
 exactly except the fingertips. It carries Thunder's calibration. The layer replaces the arm joint
 frames with Lightning's factory calibration (``calib_16320005684383956165``; 0.40 mm / 0.05 deg at the flange) and sets
-the real UR5e joint limits as for Thunder (the real Lightning's wrist_1 reaches -3.44 rad). Rebuild it with
+the real UR5e joint limits as for Thunder (the real Lightning's wrist_1 reaches -3.44 rad). It also turns the D405 and
+its mount 180 deg about the gripper axis (``--d405_turn``): Lightning's mount is bolted on the other way round from the
+build's, which sim wrist images with the objects laid out as recorded show (unturned they are mirrored; the fingers
+look the same either way), and paints the arm and the D405 like the real ones in scene_1 (``--paint``). Rebuild it with
 ``scripts_v2/tools/rpm_lab/build_calibrated_ur5e_usd.py`` (its docstring has the command).
 """
 
@@ -467,7 +470,9 @@ The D405 streams from its left imager, 9 mm left of the body center; the model's
 on Lightning's recorded wrist images (episode-20261028-185259, 10 frames) by matching the finger silhouettes, which are
 rigid with the camera: in a one-axis-at-a-time search over 3 translations (3-4 mm steps) and 3 rotations (1.5 deg
 steps), -18 mm along x is the only change that helps (silhouette IoU 0.31 -> 0.64); the 30 deg pitch, height, depth and
-roll are already right. No hand-eye calibration has been recorded."""
+roll are already right. No hand-eye calibration has been recorded. The fingers are symmetric about the gripper axis, so
+they cannot tell which side of the gripper the camera is on: Lightning's turned mount (see ``LIGHTNING_USD``) was found
+from the objects in view, and the offset holds on either side."""
 
 
 def d405_wrist_camera_cfg(
