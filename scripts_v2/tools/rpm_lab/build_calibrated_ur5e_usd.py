@@ -16,7 +16,9 @@ tool writes ``robot.usda``, a small layer that sublayers the source USD unchange
 * with ``--real_joint_limits``, the arm joint limits: the controller's +-360 deg (elbow +-180 deg, ur_description
   ``joint_limits.yaml``) instead of the source's +-180 deg wrists. The real arms use wrist angles beyond +-180 deg;
 * any light in the source asset (the builds carry a 1000-unit DomeLight), deactivated: the scene owns the lighting,
-  and an asset's light would be added again for every robot and every env.
+  and an asset's light would be added again for every robot and every env;
+* with ``--paint``, the arm's paint: the diffuse color of the named materials (UR5e paint, D405 mount), as fitted to
+  the real arm by ``fit_arm_paint_from_scene_camera.py`` (a name sets all its copies, ``<link>/<name>`` one link's).
 
 It writes a matching ``metadata.yaml``. Before writing, it checks that the source calibration reproduces the source
 USD's joint frames and link poses exactly. Run it with any Python that has ``pxr`` (no Isaac Sim app needed):
@@ -26,7 +28,8 @@ USD's joint frames and link poses exactly. Run it with any Python that has ``pxr
     python scripts_v2/tools/rpm_lab/build_calibrated_ur5e_usd.py --real_joint_limits \\
         --source_usd $A/sources/124_official_robotiq_d405_20260926_visualfix/robot.usd \\
         --source_calibration $C/thunder_kinematics.yaml --calibration $C/lightning_kinematics.yaml \\
-        --robot lightning --out_dir $A/lightning_124_official_robotiq_d405/robot
+        --robot lightning --out_dir $A/lightning_124_official_robotiq_d405/robot \\
+        --paint $C/lightning_paint_scene1_20261028.json
     python scripts_v2/tools/rpm_lab/build_calibrated_ur5e_usd.py --real_joint_limits \\
         --source_usd $A/sources/189_official_umi_fingertips_20261003_visualfix/robot.usd \\
         --source_calibration $C/thunder_kinematics.yaml --calibration $C/thunder_kinematics.yaml \\
@@ -35,12 +38,13 @@ USD's joint frames and link poses exactly. Run it with any Python that has ``pxr
 
 import argparse
 import hashlib
+import json
 import math
 import numpy as np
 import os
 import yaml
 
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 ARM = [  # (USD joint, calibration entry, parent link, child link)
     ("shoulder_pan_joint", "shoulder", "base_link", "shoulder_link"),
@@ -162,6 +166,28 @@ def sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def apply_paint(root, paint: dict) -> dict[str, int]:
+    """Set the diffuse color of the materials under ``root`` named in ``paint`` (``<name>``: every copy,
+    ``<link>/<name>``: that link's copy); returns the shaders set per entry."""
+    painted = dict.fromkeys(paint, 0)
+    for prim in Usd.PrimRange(root):
+        if not prim.IsA(UsdShade.Material):
+            continue
+        link = prim.GetPath().MakeRelativePath(root.GetPath()).pathString.split("/")[0]
+        key = f"{link}/{prim.GetName()}" if f"{link}/{prim.GetName()}" in paint else prim.GetName()
+        if key not in paint:
+            continue
+        for child in Usd.PrimRange(prim):
+            for name in ("inputs:diffuse_color_constant", "inputs:diffuseColor"):  # OmniPBR, UsdPreviewSurface
+                attr = child.GetAttribute(name)
+                if child.IsA(UsdShade.Shader) and attr and attr.Get() is not None:
+                    attr.Set(Gf.Vec3f(*paint[key]))
+                    painted[key] += 1
+    if not all(painted.values()):
+        raise RuntimeError(f"Paint matched no material: {[k for k, n in painted.items() if not n]}")
+    return painted
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source_usd", required=True)
@@ -170,6 +196,7 @@ def main():
     parser.add_argument("--robot", required=True, help="Arm name recorded in metadata.yaml, e.g. lightning.")
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--real_joint_limits", action="store_true", help="Set the arm joint limits to the UR5e's.")
+    parser.add_argument("--paint", help="Paint JSON (fit_arm_paint_from_scene_camera.py): material -> diffuse color.")
     args = parser.parse_args()
 
     source_usd = os.path.abspath(args.source_usd)
@@ -279,6 +306,12 @@ def main():
         if prim.HasAPI(UsdLux.LightAPI):
             prim.SetActive(False)
             print(f"Deactivated the asset's light {prim.GetPath()}")
+    paint = {}
+    if args.paint:
+        with open(args.paint) as f:
+            paint = json.load(f)["materials"]
+        print(f"Painted (shaders per entry): {apply_paint(r, paint)}")
+        layer.customLayerData = {**layer.customLayerData, "rpm_lab:paint": os.path.abspath(args.paint)}
     layer.Save()
 
     # 4) Re-open and check the result against the target calibration.
@@ -309,6 +342,8 @@ def main():
         "base_asset": source_usd,
         "base_asset_calibration": src_cal["hash"],
     }
+    if paint:
+        metadata["paint"] = {"source": os.path.abspath(args.paint), "diffuse_color": paint}
     metadata["calibrated_joints"] = {
         "xyz": [new_cal[e][:3] for _, e, _, _ in ARM],
         "rpy": [new_cal[e][3:] for _, e, _, _ in ARM],
