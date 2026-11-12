@@ -8,14 +8,15 @@
 Set up like the 2026-10-28 real cook_fish recordings: the same objects (``build_cook_fish_assets.py``: sizes from those
 recordings), Lightning starting where the operator started, Thunder parked at its teleop home outside the scene_1
 view, and the real action (six joint commands plus a gripper command at 20 Hz, executed through the servoJ model). The
-reset places the pot where the real pots were, the lid on it with its handle turned the way the operators grasped it,
-and the fish anywhere around the pot. Mimic splits a demo into six subtasks: grasp the lid, set it down beside the
+reset lays the pot and the fish out like one of the real episodes (a little moved), the lid on the pot with its handle
+turned the way the operators grasped it. Mimic splits a demo into six subtasks: grasp the lid, set it down beside the
 pot, grasp the fish, drop it into the pot, grasp the lid again, put it back on the pot.
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 import torch
@@ -38,6 +39,7 @@ from .pick_place_env_cfg import (
     ARM_DAMPING,
     ARM_JOINTS,
     ARM_STIFFNESS,
+    FINGER_CLOSED,
     ActionsCfg,
     finger_angle,
     object_pos,
@@ -75,35 +77,64 @@ COOK_FISH_START_JOINT_POS = {
 """Lightning's start in real episode 20261028-185333, the one closest to the per-joint median of the 10/28 cook_fish
 starts: grasp point about 0.23 m above the table, gripper pointing down."""
 
-POT_X_RANGE = (-0.17, 0.03)
-POT_Y_RANGE = (-0.17, -0.10)
-"""Pot center (world) at reset: the span of the real pot positions, read off where the gripper closed on the lid."""
+REAL_LAYOUTS_FILE = os.path.join(lab.CALIBRATION_DIR, "cook_fish_layouts_20261028.json")
+"""Where the operators found the pot and the fish, and set the lid aside, in 45 of the 2026-10-28 real episodes (the
+world model's validation episodes left out), read off the grasps by ``extract_cook_fish_layouts.py``."""
+LAYOUT_JITTER = 0.02
+"""Each object of a real layout is moved by up to this much (m) along x and y at reset, about the estimate's own
+spread."""
+FISH_POT_CLEARANCE = 0.12
+"""Least fish-to-pot distance (center to center, m) after the jitter: clear of the pot's handles (0.09 m out). The real
+ones lie 0.13-0.25 m apart."""
 LID_YAW_RANGE = (1.50, 2.25)
 """Handle direction (world yaw, rad). The operators closed the gripper with its closing axis (grasp-point x) at -4..39
 deg yaw, at a right angle to the handle; scene_1 shows the handle running along world y."""
-FISH_DISTANCE = (0.13, 0.20)
-"""Fish center distance from the pot center; any direction that keeps the fish in ``OBJECT_X/Y_RANGE``."""
 FISH_YAW_RANGE = (1.27, 2.37)  # the fish's length across the operators' closing axis
 OBJECT_X_RANGE = (-0.36, 0.06)
 OBJECT_Y_RANGE = (-0.36, -0.04)
 """Where objects may lie (world): inside Lightning's real teleop workspace, clear of the table's front edge."""
-MAX_REACH = 0.70
-"""Farthest object (fish, lid set aside) from Lightning's base, horizontally (m). The scripted demos and their Mimic
-copies grasp with the gripper pointing straight down, and beyond about 0.73 m the elbow is straight and IK stops short of
-the object. The real fish grasps lie 0.50-0.76 m out, 90 % of them within 0.70 m; the operators reach the far ones with
-the gripper tilted about 12 deg."""
+MAX_REACH = 0.74
+"""Farthest object (pot, fish) from Lightning's base, horizontally (m); real layouts farther out are not used. The real
+fish grasps lie 0.49-0.76 m out (2 of 45 beyond 0.74). The scripted demos lean the gripper like the operators (about 12
+deg, away from the base), which reaches about 3 cm past the 0.73 m of a straight-down grasp with the elbow straight."""
+LID_ASIDE_CLEARANCE = LID["radius"] + 0.5 * math.hypot(*FISH["size"][:2]) + 0.01
+"""Least distance (m) from the fish to a lid set down beside the pot (lid radius + fish half-diagonal + 1 cm)."""
 POT_POS = (-0.07, -0.13, lab.WORK_SURFACE_Z)
 FISH_POS = (-0.22, -0.16, lab.WORK_SURFACE_Z)
 
-GRIPPER_OPEN_BELOW = 0.2  # finger_joint (rad): released
+
+def _real_layouts(path: str) -> torch.Tensor:
+    """(L, 3, 2) env-frame xy of the pot, the fish and the set-aside lid in each real layout within ``MAX_REACH``.
+
+    The file holds grasp points in Lightning's controller Base frame (base_link turned 180 deg about z); they are moved
+    into the env frame with the twin's base pose, the one fitted to scene_1 views of the real arm.
+    """
+    with open(path) as f:
+        layouts = json.load(f)["layouts"]
+    points = torch.tensor([[lay["pot"], lay["fish"], lay["lid_aside"]] for lay in layouts], dtype=torch.float64)
+    base_rot = math_utils.matrix_from_quat(torch.tensor(lab.LIGHTNING_ROT, dtype=torch.float64))
+    rot = base_rot @ torch.diag(torch.tensor([-1.0, -1.0, 1.0], dtype=torch.float64))
+    xy = (points @ rot.T + torch.tensor(lab.LIGHTNING_POS, dtype=torch.float64))[..., :2]
+    reach = (xy[:, :2] - torch.tensor(lab.LIGHTNING_POS[:2], dtype=torch.float64)).norm(dim=-1)
+    return xy[(reach < MAX_REACH).all(dim=1)].float()
+
+
+REAL_LAYOUTS = _real_layouts(REAL_LAYOUTS_FILE)
+"""The real layouts the reset draws from (``_real_layouts``)."""
+
+RELEASE_SLACK = 0.05
+"""A gripper commanded open counts as released once its finger_joint is within this much (rad) of the commanded
+opening: nothing holds the fingers. The commanded opening varies like the operators' (0.2-0.3 after letting go, from the
+0.0-1.0 trigger), and a gripper opened to 0.3 is closed further (0.25 rad) than one holding the fish (0.28 rad when told
+1.0)."""
 LIFT_CLEARANCE = 0.02
-"""A held object counts as lifted once its bottom (its origin) is this far above the pot rim, clear of everything on
-the table. The grasp signals wait for it: Mimic starts the next subtask's segment where a signal first rises, so the move
+"""A held object counts as lifted once its bottom (its origin) is this far above the pot rim, clear of everything on the
+table. The grasp signals wait for it: Mimic starts the next subtask's segment where a signal first rises, so the move
 between two segments (to the next segment's start, transformed with another object) happens in free space instead of
 dragging the object over the table."""
-RETREAT_HEIGHT = 0.12
+RETREAT_HEIGHT = 0.11
 """Grasp-point height above the table at which the open gripper is clear after letting go; the release signals wait
-for it, for the same reason."""
+for it, for the same reason. The operators move on to the next object at about this height (11-13 cm)."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -129,7 +160,9 @@ def _lifted(env: ManagerBasedRLEnv, name: str) -> torch.Tensor:
 
 
 def _released(env: ManagerBasedRLEnv) -> torch.Tensor:
-    return finger_angle(env)[:, 0] < GRIPPER_OPEN_BELOW
+    """The gripper is commanded open (below 0.5) and its fingers have opened that far (``RELEASE_SLACK``)."""
+    command = env.action_manager.get_term("gripper").raw_actions[:, 0]
+    return (command < 0.5) & (finger_angle(env)[:, 0] < command * FINGER_CLOSED + RELEASE_SLACK)
 
 
 def _retreated(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -194,8 +227,9 @@ def object_fell(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def reset_cook_fish_layout(env: ManagerBasedRLEnv, env_ids: torch.Tensor, candidates: int = 64):
-    """Pot in ``POT_X/Y_RANGE``, lid seated on it, fish around it (``FISH_DISTANCE``, inside ``OBJECT_X/Y_RANGE`` and
-    ``MAX_REACH``)."""
+    """A real layout (``REAL_LAYOUTS``) with the pot and the fish each moved by up to ``LAYOUT_JITTER``, the lid seated
+    on the pot: the first of several random draws that keeps the fish ``FISH_POT_CLEARANCE`` from the pot and both
+    within ``MAX_REACH``."""
     n, device = len(env_ids), env.device
     origins = env.scene.env_origins[env_ids]
 
@@ -206,21 +240,17 @@ def reset_cook_fish_layout(env: ManagerBasedRLEnv, env_ids: torch.Tensor, candid
         zeros = torch.zeros_like(yaw)
         return math_utils.quat_from_euler_xyz(zeros, zeros, yaw)
 
-    z = lab.WORK_SURFACE_Z + 0.0005
-    pot = torch.stack([uniform(*POT_X_RANGE), uniform(*POT_Y_RANGE), torch.full((n,), z, device=device)], dim=-1)
+    layouts = REAL_LAYOUTS.to(device)
+    xy = layouts[torch.randint(len(layouts), (n, candidates), device=device), :2]  # (n, candidates, pot/fish, 2)
+    xy = xy + uniform(-LAYOUT_JITTER, LAYOUT_JITTER, n, candidates, 2, 2)
+    base = lightning_base_xy(env)[env_ids, None, None]
+    valid = ((xy[:, :, 1] - xy[:, :, 0]).norm(dim=-1) > FISH_POT_CLEARANCE) & (
+        (xy - base).norm(dim=-1) < MAX_REACH
+    ).all(dim=-1)
+    xy = xy[torch.arange(n, device=device), valid.int().argmax(dim=1)]
+    z = torch.full((n, 1), lab.WORK_SURFACE_Z + 0.0005, device=device)
+    pot, fish = torch.cat([xy[:, 0], z], dim=-1), torch.cat([xy[:, 1], z], dim=-1)
     lid = pot + torch.tensor([0.0, 0.0, POT["rim_height"] + 0.0005], device=device)
-    # Fish: the first of several random directions that keeps it inside the object area and within reach.
-    distance, angle = uniform(*FISH_DISTANCE, n, candidates), uniform(-math.pi, math.pi, n, candidates)
-    xy = pot[:, None, :2] + distance[..., None] * torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
-    inside = (
-        (xy[..., 0] > OBJECT_X_RANGE[0])
-        & (xy[..., 0] < OBJECT_X_RANGE[1])
-        & (xy[..., 1] > OBJECT_Y_RANGE[0])
-        & (xy[..., 1] < OBJECT_Y_RANGE[1])
-        & ((xy - lightning_base_xy(env)[env_ids, None]).norm(dim=-1) < MAX_REACH)
-    )
-    first = inside.int().argmax(dim=1)
-    fish = torch.cat([xy[torch.arange(n, device=device), first], pot[:, 2:]], dim=-1)
 
     poses = {
         "pot": (pot, yaw_quat(uniform(-0.4, 0.4))),
@@ -360,15 +390,16 @@ class LightningCookFishMimicEnvCfg(LightningCookFishEnvCfg, MimicEnvCfg):
         self.datagen_config.max_num_failures = 50
         self.datagen_config.seed = 1
         # source segments Lightning can follow here (lightning_mimic_env.NearestNeighborReachableStrategy): targets
-        # within 0.72 m of the base, where a straight-down grasp at table height still reaches
-        reachable = {"nn_k": 3, "max_reach": 0.72}
+        # within reach of the base (MAX_REACH, plus 1 cm for the noise on the targets)
+        reachable = {"nn_k": 3, "max_reach": MAX_REACH + 0.01}
         common = dict(
             selection_strategy="nearest_neighbor_reachable",
             selection_strategy_kwargs=reachable,
             action_noise=0.003,
-            # 1 s from one segment to the next (up to ~30 cm, in free space: see LIFT_CLEARANCE): with 5 steps the joint
-            # commands jumped up to 0.22 rad per step (4.4 rad/s, beyond the UR5e's 3.14) and a held fish slipped
-            num_interpolation_steps=20,
+            # 0.4 s from one segment to the next, in free space (see LIFT_CLEARANCE) and short since each subtask picks
+            # a nearby source segment; with 5 steps and up to 30 cm (one source per episode) the joint commands jumped
+            # up to 0.22 rad per step (4.4 rad/s, beyond the UR5e's 3.14) and a held fish slipped
+            num_interpolation_steps=8,
             num_fixed_steps=0,
             apply_noise_during_interpolation=False,
         )
@@ -381,12 +412,12 @@ class LightningCookFishMimicEnvCfg(LightningCookFishEnvCfg, MimicEnvCfg):
                 subtask_term_signal="lid_off",
                 **{
                     **place,
-                    # the set-down spot moves with the pot: keep it off the fish (lid radius + fish half-diagonal +
-                    # 1 cm; v3 set the lid on the fish in 10 of 69 attempts) and in reach of the regrasp
+                    # the set-down spot moves with the pot: keep it off the fish (v3 set the lid on the fish in 10 of
+                    # 69 attempts) and in reach of the regrasp (the real ones lie up to 0.71 m out)
                     "selection_strategy_kwargs": {
                         **reachable,
-                        "release_reach": 0.65,
-                        "release_clearance": {"fish": LID["radius"] + 0.5 * math.hypot(*FISH["size"][:2]) + 0.01},
+                        "release_reach": MAX_REACH - 0.02,
+                        "release_clearance": {"fish": LID_ASIDE_CLEARANCE},
                     },
                 },
             ),

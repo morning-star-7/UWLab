@@ -25,7 +25,11 @@ from collections.abc import Sequence
 
 import isaaclab.utils.math as PoseUtils
 from isaaclab.envs import ManagerBasedRLMimicEnv
-from isaaclab_mimic.datagen.selection_strategy import NearestNeighborObjectStrategy
+
+try:  # isaaclab_mimic's datagen package imports IPython, which only mimic.py (Mimic's own scripts) puts on the path
+    from isaaclab_mimic.datagen.selection_strategy import NearestNeighborObjectStrategy
+except ImportError:  # e.g. scripted_demos.py: no source selection there
+    NearestNeighborObjectStrategy = None
 
 from . import scene_cfg as lab
 from .kinematics import URKinematics
@@ -38,8 +42,8 @@ target out of reach would otherwise straighten it and fold it positive, where th
 At 0.2 rad the reach is 4 mm short of a straight arm."""
 
 _selection_context: dict = {}
-"""The scene Mimic is selecting a source segment for (object poses and Lightning's base, env frame), which Mimic does not
-pass to a selection strategy: it calls ``get_object_poses`` for that one env just before selecting."""
+"""The scene Mimic is selecting a source segment for (object poses and Lightning's base, env frame), which Mimic does
+not pass to a selection strategy: it calls ``get_object_poses`` for that one env just before selecting."""
 
 
 class LightningMimicEnv(ManagerBasedRLMimicEnv):
@@ -147,51 +151,53 @@ class LightningMimicEnv(ManagerBasedRLMimicEnv):
         return {name: signal[env_ids] for name, signal in self.obs_buf["subtask_terms"].items()}
 
 
-class NearestNeighborReachableStrategy(NearestNeighborObjectStrategy):
-    """``nearest_neighbor_object`` among the source segments Lightning can still follow once Mimic has moved them with
-    the current object pose, or the segment that misses least if none can.
+if NearestNeighborObjectStrategy is not None:
 
-    A segment is followed when every target lies within ``max_reach`` of the base (horizontally) and, where the gripper
-    opens, the grasp point is within ``release_reach`` of the base and at least ``release_clearance[name]`` from each
-    named object. A segment carries the move from where the last one ended, which for a grasp can be 30 cm from the
-    object: turned with the object's yaw it may swing out of reach. And a set-down spot kept relative to the pot may
-    land on the fish.
-    """
+    class NearestNeighborReachableStrategy(NearestNeighborObjectStrategy):
+        """``nearest_neighbor_object`` among the source segments Lightning can still follow once Mimic has moved them
+        with the current object pose, or the segment that misses least if none can.
 
-    NAME = "nearest_neighbor_reachable"
+        A segment is followed when every target lies within ``max_reach`` of the base (horizontally) and, where the
+        gripper opens, the grasp point is within ``release_reach`` of the base and at least ``release_clearance[name]``
+        from each named object. A segment carries the move from where the last one ended, which for a grasp can be 30 cm
+        from the object: turned with the object's yaw it may swing out of reach. And a set-down spot kept relative to
+        the pot may land on the fish.
+        """
 
-    def select_source_demo(
-        self,
-        eef_pose,
-        object_pose,
-        src_subtask_datagen_infos,
-        pos_weight=1.0,
-        rot_weight=1.0,
-        nn_k=3,
-        max_reach=0.72,
-        release_reach=None,
-        release_clearance=None,
-    ):
-        base, objects = _selection_context["base_xy"], _selection_context["objects"]
-        misses = []
-        for info in src_subtask_datagen_infos:
-            (src_object,) = info.object_poses.values()
-            xy = (object_pose @ torch.linalg.inv(src_object[0]) @ info.target_eef_pose)[:, :2, 3]
-            miss = ((xy - base).norm(dim=-1).max() - max_reach).clamp(min=0)
-            closed = info.gripper_action[:, 0] > 0.5
-            opens = (closed[:-1] & ~closed[1:]).nonzero()
-            if len(opens):
-                spot = xy[opens[0, 0] + 1]
-                if release_reach is not None:
-                    miss = miss + ((spot - base).norm() - release_reach).clamp(min=0)
-                for name, clearance in (release_clearance or {}).items():
-                    miss = miss + (clearance - (spot - objects[name][:2, 3]).norm()).clamp(min=0)
-            misses.append(miss)
-        misses = torch.stack(misses)
-        feasible = (misses == 0).nonzero()[:, 0]
-        if len(feasible) == 0:
-            return int(misses.argmin())
-        pick = super().select_source_demo(
-            eef_pose, object_pose, [src_subtask_datagen_infos[i] for i in feasible], pos_weight, rot_weight, nn_k
-        )
-        return int(feasible[pick])
+        NAME = "nearest_neighbor_reachable"
+
+        def select_source_demo(
+            self,
+            eef_pose,
+            object_pose,
+            src_subtask_datagen_infos,
+            pos_weight=1.0,
+            rot_weight=1.0,
+            nn_k=3,
+            max_reach=0.72,
+            release_reach=None,
+            release_clearance=None,
+        ):
+            base, objects = _selection_context["base_xy"], _selection_context["objects"]
+            misses = []
+            for info in src_subtask_datagen_infos:
+                (src_object,) = info.object_poses.values()
+                xy = (object_pose @ torch.linalg.inv(src_object[0]) @ info.target_eef_pose)[:, :2, 3]
+                miss = ((xy - base).norm(dim=-1).max() - max_reach).clamp(min=0)
+                closed = info.gripper_action[:, 0] > 0.5
+                opens = (closed[:-1] & ~closed[1:]).nonzero()
+                if len(opens):
+                    spot = xy[opens[0, 0] + 1]
+                    if release_reach is not None:
+                        miss = miss + ((spot - base).norm() - release_reach).clamp(min=0)
+                    for name, clearance in (release_clearance or {}).items():
+                        miss = miss + (clearance - (spot - objects[name][:2, 3]).norm()).clamp(min=0)
+                misses.append(miss)
+            misses = torch.stack(misses)
+            feasible = (misses == 0).nonzero()[:, 0]
+            if len(feasible) == 0:
+                return int(misses.argmin())
+            pick = super().select_source_demo(
+                eef_pose, object_pose, [src_subtask_datagen_infos[i] for i in feasible], pos_weight, rot_weight, nn_k
+            )
+            return int(feasible[pick])
