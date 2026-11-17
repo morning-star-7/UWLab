@@ -106,6 +106,12 @@ def main():
         default=None,
         help="After training, delete all but the newest N checkpoints (resumed runs keep the old ones otherwise).",
     )
+    parser.add_argument(
+        "--normalizer_data",
+        default=None,
+        help="Take the action normalizer from this dataset's train split (a name is looked up next to --data): e.g. "
+        "stage 3 on the real episodes alone after a co-trained stage 2.",
+    )
     parser.add_argument("--eval", default=None, help="Validate this checkpoint (rollouts) instead of training.")
     parser.add_argument("--eval_actions", choices=("true", "hold"), default="true", help="Rollout actions for --eval.")
     parser.add_argument("--eval_horizon", type=int, default=340, help="Rollout frames for --eval (17 s at 20 fps).")
@@ -190,6 +196,13 @@ def main():
         return
     os.makedirs(run_dir, exist_ok=True)
     env = dict(os.environ, WANDB_DIR=run_dir, PYTHONUNBUFFERED="1")
+    if args.normalizer_data:
+        source = args.normalizer_data
+        if not os.path.isabs(source):
+            source = os.path.join(os.path.dirname(os.path.abspath(args.data)), source)
+        if not glob.glob(os.path.join(source, "train", "cache*.zarr.zip")):
+            parser.error(f"--normalizer_data: no train/cache*.zarr.zip under {source}")
+        env["IWS_NORMALIZER_DATA"] = source
     if args.eval:
         env["IWS_EVAL_ACTIONS"] = args.eval_actions
         env["IWS_HORIZON_METRICS"] = os.path.join(run_dir, "horizon_metrics.json")

@@ -13,6 +13,15 @@ only and IWS trains in fp32, so the dynamics model (stage 2/3) fails there with 
 takes IWS's other branch and never saw it. The memory-efficient and math kernels are added as fallbacks: flash is
 still used whenever it applies.
 
+Fix: IWS's ``main.py`` repoints ``<project>/latest-run`` at each new run (unlink, then symlink). Two jobs starting
+together race on it and the loser dies with FileExistsError (a 2026-11-16 eval job did); the link is a convenience, so
+the loser leaves it to the winner.
+
+``IWS_NORMALIZER_DATA=<dataset dir>`` (``train_iws.py --normalizer_data``) takes the training set's action normalizer
+from that dataset's train split instead of its own. IWS refits the normalizer to the training set at every new stage,
+overriding the loaded checkpoint's: a stage trained on a subset (e.g. stage 3 on the real episodes alone, after a
+co-trained stage 2) would otherwise rescale the actions the dynamics model learned (here by 9-42 % per joint).
+
 Evaluation hooks (``train_iws.py --eval``), off unless their environment variable is set:
 
 * ``IWS_EVAL_ACTIONS=hold`` replaces every action of a validation rollout with its first one (the arm told to stay
@@ -23,9 +32,12 @@ Evaluation hooks (``train_iws.py --eval``), off unless their environment variabl
   repeats the first frame (nothing moves), logged as ``<namespace>/h<from>-<to>/...`` and written to the file.
 """
 
+import copy
+import glob
 import json
 import math
 import os
+import pathlib
 import runpy
 import sys
 
@@ -104,6 +116,46 @@ def add_eval_hooks():
         LatentWorldModel.on_validation_epoch_end = with_horizon_metrics
 
 
+def tolerate_latest_run_race():
+    symlink_to = pathlib.Path.symlink_to
+
+    def symlink_unless_taken(self, target, *args, **kwargs):
+        try:
+            return symlink_to(self, target, *args, **kwargs)
+        except FileExistsError:
+            if self.name != "latest-run":
+                raise
+            print(f"{self} was just repointed by another run: left as is", flush=True)
+
+    pathlib.Path.symlink_to = symlink_unless_taken
+
+
+def add_normalizer_hook():
+    source = os.environ.get("IWS_NORMALIZER_DATA")
+    if not source:
+        return
+    import zarr
+    from interactive_world_sim.datasets.latent_dynamics.real_aloha_dataset import RealAlohaDataset
+
+    get_normalizer = RealAlohaDataset.get_normalizer
+
+    def normalizer_from_source(self, *args, **kwargs):
+        if getattr(self, "is_val", False):
+            return get_normalizer(self, *args, **kwargs)
+        if self.lowdim_keys:
+            raise RuntimeError(f"IWS_NORMALIZER_DATA covers the action only, not {self.lowdim_keys}")
+        (cache,) = glob.glob(os.path.join(source, "train", "cache*.zarr.zip"))
+        with zarr.ZipStore(cache, mode="r") as store:
+            actions = zarr.open(store, mode="r")["data/action"][:]
+        proxy = copy.copy(self)
+        proxy.replay_buffer = {"action": actions}  # all that get_normalizer reads without low-dim observations
+        low, high = ([round(float(v), 3) for v in a] for a in (actions.min(0), actions.max(0)))
+        print(f"Action normalizer from {cache}: min {low}, max {high}", flush=True)
+        return get_normalizer(proxy, *args, **kwargs)
+
+    RealAlohaDataset.get_normalizer = normalizer_from_source
+
+
 def main():
     iws = os.path.abspath(sys.argv[1])
     sys.argv = [os.path.join(iws, "main.py"), *sys.argv[2:]]
@@ -112,6 +164,8 @@ def main():
     import interactive_world_sim.algorithms.models.attention as attention
 
     attention.sdpa_kernel = sdpa_kernel_with_fallbacks
+    tolerate_latest_run_race()
+    add_normalizer_hook()
     add_eval_hooks()
     runpy.run_path(sys.argv[0], run_name="__main__")
 
