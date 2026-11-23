@@ -14,7 +14,8 @@ Runs IWS's own ``main.py`` (through ``iws_main.py``, which adds runtime fixes) w
 
 ``--eval <checkpoint>`` instead validates a trained model (any stage's checkpoint) the stage-2 way: from the first frame
 of each validation episode, the dynamics rolls out ``--eval_horizon`` frames under the recorded actions (or, with
-``--eval_actions hold``, under the first action throughout) and the decoder renders them. Besides IWS's metrics it
+``--eval_actions hold``, under the first action throughout) and the decoder renders them; ``--eval_start_every N``
+rolls out from every N-th frame of each episode as well (many rollouts per episode). Besides IWS's metrics it
 writes ``<runs>/<name>/horizon_metrics.json``: PSNR / SSIM by rollout horizon, and the same for repeating the first frame.
 
 Runs go to ``<runs>/<name>/`` (Hydra outputs, checkpoints, offline wandb logs; sync later with ``wandb sync`` if
@@ -112,9 +113,24 @@ def main():
         help="Take the action normalizer from this dataset's train split (a name is looked up next to --data): e.g. "
         "stage 3 on the real episodes alone after a co-trained stage 2.",
     )
+    parser.add_argument(
+        "--real_share",
+        type=float,
+        default=None,
+        help="Co-training ratio at sampling time: probability that a training sample is real (the rest sim), whatever "
+        "the two domains' sizes in --data. Default: IWS's uniform shuffle (real share = real frames' share).",
+    )
     parser.add_argument("--eval", default=None, help="Validate this checkpoint (rollouts) instead of training.")
     parser.add_argument("--eval_actions", choices=("true", "hold"), default="true", help="Rollout actions for --eval.")
     parser.add_argument("--eval_horizon", type=int, default=340, help="Rollout frames for --eval (17 s at 20 fps).")
+    parser.add_argument(
+        "--eval_start_every",
+        type=int,
+        default=None,
+        help="With --eval: roll out from frame 0 and every this many frames of each validation episode (multi-start), "
+        "--eval_horizon frames each; the rollouts go to <run>/wandb/rollouts/*.mp4 + index.json (mirrored with the "
+        "wandb logs). Default: one rollout per episode, from its start, logged the IWS way.",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Print the command only.")
     parser.add_argument("overrides", nargs="*", help="Extra Hydra overrides, passed through to IWS.")
     args = parser.parse_args()
@@ -203,9 +219,17 @@ def main():
         if not glob.glob(os.path.join(source, "train", "cache*.zarr.zip")):
             parser.error(f"--normalizer_data: no train/cache*.zarr.zip under {source}")
         env["IWS_NORMALIZER_DATA"] = source
+    if args.real_share is not None and not args.eval:
+        if not 0 < args.real_share < 1:
+            parser.error("--real_share must be between 0 and 1")
+        env["IWS_REAL_SHARE"] = str(args.real_share)
     if args.eval:
         env["IWS_EVAL_ACTIONS"] = args.eval_actions
         env["IWS_HORIZON_METRICS"] = os.path.join(run_dir, "horizon_metrics.json")
+        if args.eval_start_every:
+            env["IWS_EVAL_START_EVERY"] = str(args.eval_start_every)
+            env["IWS_EVAL_HORIZON"] = str(args.eval_horizon)
+            env["IWS_ROLLOUT_DIR"] = os.path.join(run_dir, "wandb", "rollouts")
     if resume_from or args.eval:
         # Torch >= 2.6 loads weights only by default; IWS's Lightning checkpoints (our own) also hold OmegaConf objects.
         env["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"

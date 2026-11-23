@@ -4,7 +4,8 @@
 #   RPM_PROJECT_DIR, RPM_BRANCH, RPM_COMMIT (full sha), RPM_COMMIT_FROM=msi_submit:<sha>,
 #   RUN (run name), STAGE (1|2|3), DATASET (under data/iws/), LOAD_AE_RUN (previous stage's run, stages 2-3),
 #   MAX_TIME (Lightning DD:HH:MM:SS, before the Slurm limit), TRAIN_ARGS_B64 (base64 JSON list of extra arguments),
-#   MODE (train | eval), EVAL_RUNS (eval: ':'-separated runs whose newest checkpoints to validate with rollouts).
+#   MODE (train | eval), EVAL_RUNS (eval: ':'-separated runs whose newest checkpoints to validate with rollouts),
+#   EVAL_ACTIONS (eval: 'true:hold' (default), 'true' or 'hold').
 # Checkpoints are saved every 2000 steps (about 10 min on an H100); training stopped by MAX_TIME loses what came after
 # the last one (Lightning does not save on a step-based schedule's stop).
 # The training resumes from the run's newest checkpoint (full Lightning state), so a requeue or the next job of a
@@ -23,7 +24,7 @@ set -euo pipefail
 
 : "${RPM_PROJECT_DIR:?}" "${RPM_BRANCH:?}" "${RUN:?}" "${STAGE:?}" "${DATASET:?}"
 export RPM_COMMIT="${RPM_COMMIT:-}" RPM_COMMIT_FROM="${RPM_COMMIT_FROM:-}"
-export MODE="${MODE:-train}" EVAL_RUNS="${EVAL_RUNS:-}"
+export MODE="${MODE:-train}" EVAL_RUNS="${EVAL_RUNS:-}" EVAL_ACTIONS="${EVAL_ACTIONS:-true:hold}"
 export LOAD_AE_RUN="${LOAD_AE_RUN:-}" MAX_TIME="${MAX_TIME:-00:23:30:00}" TRAIN_ARGS_B64="${TRAIN_ARGS_B64:-W10=}"
 export REPO="${RPM_PROJECT_DIR}/UWLab"
 export WORKTREE="${RPM_PROJECT_DIR}/UWLab-run-${RUN}"
@@ -96,10 +97,11 @@ mapfile -t extra < <(python -c "import base64, json, os; print('\n'.join(json.lo
 if [ "${MODE}" = "eval" ]; then
     # rollouts of each run's newest checkpoint, under the recorded and under held actions
     IFS=: read -r -a eval_runs <<<"${EVAL_RUNS}"
+    IFS=: read -r -a eval_actions <<<"${EVAL_ACTIONS}"
     for run in "${eval_runs[@]}"; do
         ckpt=$(newest_ckpt "${run}")
         [ -n "${ckpt}" ] || { echo "FATAL: no checkpoint in ${RUNS}/${run}/checkpoints"; exit 1; }
-        for actions in true hold; do
+        for actions in "${eval_actions[@]}"; do
             args=(--name "${RUN}_${run}_${actions}" --data "${DATA_DIR}" --runs "${RUNS}" --workers 6
                   --eval "${ckpt}" --eval_actions "${actions}")
             for a in "${extra[@]}"; do [ -n "${a}" ] && args+=("${a}"); done

@@ -74,6 +74,12 @@ def main():
     parser.add_argument("--run", required=True, help="Run name (job name, runs/<run>, worktree UWLab-run-<run>).")
     parser.add_argument("--stage", type=int, choices=(1, 2, 3), help="Training stage (not with --eval).")
     parser.add_argument("--eval", default="", help="Comma-separated runs whose newest checkpoints to validate.")
+    parser.add_argument(
+        "--eval_actions",
+        default="true,hold",
+        choices=("true,hold", "true", "hold"),
+        help="With --eval: rollouts under the recorded actions, under held actions, or both (default).",
+    )
     parser.add_argument("--dataset", required=True, help="Dataset directory name under data/iws/ on MSI.")
     parser.add_argument("--load_ae_run", default="", help="Previous stage's run (stages 2 and 3).")
     parser.add_argument("--branch", default=None, help="Branch to train (default: the current branch).")
@@ -156,6 +162,7 @@ def main():
         "RUN": args.run,
         "MODE": "eval" if eval_runs else "train",
         "EVAL_RUNS": ":".join(eval_runs),
+        "EVAL_ACTIONS": args.eval_actions.replace(",", ":"),
         "STAGE": str(args.stage or 2),
         "DATASET": args.dataset,
         "LOAD_AE_RUN": args.load_ae_run,

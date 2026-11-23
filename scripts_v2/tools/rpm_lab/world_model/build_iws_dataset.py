@@ -19,7 +19,10 @@ loads, ``<out>/{train,val}/cache[_res_<R>].zarr.zip``:
 
 With the cache in place IWS never runs its ALOHA conversion, so ``dataset.action_mode`` does not matter. Frames are
 streamed into the zip one chunk at a time (no whole-dataset array in memory). Validation holds out real episodes
-(``--val_real``): the co-training question is how well the model predicts the real robot.
+(``--val_real`` random ones, or ``--val_real_list``): the co-training question is how well the model predicts the
+real robot; ``--val_sim_root`` adds whole sim datasets (kept out of ``--sim``) for evaluation in sim. IWS samples training windows
+uniformly over frames, so ``--real_repeat K`` writes each real training episode K times to keep the real share of a
+large sim set (e.g. 45 real + 1150 sim: 4% of the frames, 25% with K = 8).
 
 Runs in the IWS venv (``/data/cui00191/rpm_lab_envs/iws``)::
 
@@ -169,6 +172,19 @@ def main():
     parser.add_argument("--sim_episodes", type=int, default=None, help="Sim training episodes (default: all left).")
     parser.add_argument("--val_real", type=int, default=0, help="Real episodes held out for validation.")
     parser.add_argument("--val_sim", type=int, default=0, help="Sim episodes held out for validation.")
+    parser.add_argument(
+        "--val_real_list",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Episode indices of the (single) real dataset held out for validation, instead of --val_real random ones.",
+    )
+    parser.add_argument(
+        "--val_sim_root", nargs="*", default=[], help="Sim LeRobot dataset roots whose episodes all go to validation."
+    )
+    parser.add_argument(
+        "--real_repeat", type=int, default=1, help="Times each real training episode is written (its sampling weight)."
+    )
     parser.add_argument("--cameras", choices=list(CAMERA_SETS), default="scene")
     parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
@@ -179,17 +195,30 @@ def main():
     cameras = CAMERA_SETS[args.cameras]
     real = [ep for root in args.real for ep in list_episodes(root, REAL, cameras)]
     sim = [ep for root in args.sim for ep in list_episodes(root, SIM, cameras)]
-    val_real = pick(real, args.val_real, rng) if args.val_real else []
+    if args.val_real_list is not None:
+        if len(args.real) != 1 or args.val_real:
+            raise ValueError("--val_real_list names episodes of one --real dataset (and replaces --val_real)")
+        wanted = set(args.val_real_list)
+        val_real = [ep for ep in real if ep.index in wanted]
+        if len(val_real) != len(wanted):
+            raise ValueError(f"--val_real_list: {sorted(wanted - {ep.index for ep in val_real})} not in {args.real[0]}")
+    else:
+        val_real = pick(real, args.val_real, rng) if args.val_real else []
     val_sim = pick(sim, args.val_sim, rng) if args.val_sim else []
+    val_sim += [ep for root in args.val_sim_root for ep in list_episodes(root, SIM, cameras)]
     held = {(ep.root, ep.index) for ep in val_real + val_sim}
     train_real = pick([ep for ep in real if (ep.root, ep.index) not in held], args.real_episodes, rng)
     train_sim = pick([ep for ep in sim if (ep.root, ep.index) not in held], args.sim_episodes, rng)
-    train, val = train_real + train_sim, val_real + val_sim
+    if args.real_repeat < 1:
+        raise ValueError("--real_repeat must be at least 1")
+    train, val = train_real * args.real_repeat + train_sim, val_real + val_sim
     if not train or not val:
         raise ValueError(f"Need training and validation episodes (train {len(train)}, val {len(val)})")
+    real_steps = sum(e.length for e in train if e.domain == REAL)
     print(
-        f"train: {len(train_real)} real + {len(train_sim)} sim episodes, {sum(e.length for e in train)} steps; "
-        f"val: {len(val_real)} real + {len(val_sim)} sim"
+        f"train: {len(train_real)} real{f' x {args.real_repeat}' if args.real_repeat > 1 else ''} + {len(train_sim)} sim"
+        f" episodes, {sum(e.length for e in train)} steps ({100 * real_steps / sum(e.length for e in train):.1f}% real);"
+        f" val: {len(val_real)} real + {len(val_sim)} sim"
     )
 
     name = "cache.zarr.zip" if args.resolution == 128 else f"cache_res_{args.resolution}.zarr.zip"
@@ -201,6 +230,7 @@ def main():
         "action": "lightning_cmd_joint_1..6 (rad), lightning_cmd_gripper (0 open .. 1 closed)",
         "domains": {"0": "real", "1": "sim"},
         "seed": args.seed,
+        "real_repeat": args.real_repeat,
         "splits": {
             split: [{"root": e.root, "episode": e.index, "domain": e.domain, "length": e.length} for e in episodes]
             for split, episodes in (("train", train), ("val", val))
