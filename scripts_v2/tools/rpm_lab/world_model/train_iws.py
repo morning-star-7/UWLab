@@ -117,8 +117,9 @@ def main():
         "--real_share",
         type=float,
         default=None,
-        help="Co-training ratio at sampling time: probability that a training sample is real (the rest sim), whatever "
-        "the two domains' sizes in --data. Default: IWS's uniform shuffle (real share = real frames' share).",
+        help="Co-training ratio at sampling time: share of every training batch that is real (the rest sim), whatever "
+        "the two domains' sizes in --data; a fractional count per batch is rounded at random (mean exact). Default: "
+        "IWS's uniform shuffle (real share = real frames' share).",
     )
     parser.add_argument("--eval", default=None, help="Validate this checkpoint (rollouts) instead of training.")
     parser.add_argument("--eval_actions", choices=("true", "hold"), default="true", help="Rollout actions for --eval.")

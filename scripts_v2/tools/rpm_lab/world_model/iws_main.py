@@ -22,10 +22,11 @@ from that dataset's train split instead of its own. IWS refits the normalizer to
 overriding the loaded checkpoint's: a stage trained on a subset (e.g. stage 3 on the real episodes alone, after a
 co-trained stage 2) would otherwise rescale the actions the dynamics model learned (here by 9-42 % per joint).
 
-``IWS_REAL_SHARE=<0..1>`` (``train_iws.py --real_share``) sets the co-training ratio at sampling time: every training
-sample is real with this probability and sim otherwise (drawn with replacement, uniformly over the windows of its
-domain, from the dataset's per-step ``data/domain``). Without it IWS shuffles all windows, so the real share is the
-real frames' share of the dataset.
+``IWS_REAL_SHARE=<0..1>`` (``train_iws.py --real_share``) sets the co-training ratio at sampling time, inside every
+batch: a batch of B samples holds B x share real ones and the rest sim (a fractional count is rounded up or down at
+random so that the mean is exact: B = 16, share 0.1 gives 1 or 2 real samples per batch), each drawn uniformly from the
+windows of its domain (the dataset's per-step ``data/domain``). Without it IWS shuffles all windows, so the real share
+is the real frames' share of the dataset and a small batch is mostly of one domain.
 
 Evaluation hooks (``train_iws.py --eval``), off unless their environment variable is set:
 
@@ -312,8 +313,27 @@ def add_normalizer_hook():
     RealAlohaDataset.get_normalizer = normalizer_from_source
 
 
+def mixed_batches(real, sim, batch_size: int, share: float, batches: int):
+    """Batch sampler: every batch has ``batch_size * share`` real samples (in the mean), the rest sim."""
+    import numpy as np
+    import torch
+
+    class MixedBatches(torch.utils.data.Sampler):
+        def __len__(self):
+            return batches
+
+        def __iter__(self):
+            rng = np.random.default_rng()  # new draws every epoch and every resumed job
+            for _ in range(batches):
+                n_real = min(batch_size, int(batch_size * share + rng.random()))  # floor, or one more: mean exact
+                batch = np.concatenate([rng.choice(real, n_real), rng.choice(sim, batch_size - n_real)])
+                yield rng.permutation(batch).tolist()
+
+    return MixedBatches()
+
+
 def add_real_share_sampler():
-    """``IWS_REAL_SHARE``: the training loader draws each sample from the real windows with this probability."""
+    """``IWS_REAL_SHARE``: every training batch is this share real, the rest sim."""
     if not os.environ.get("IWS_REAL_SHARE"):
         return
     share = float(os.environ["IWS_REAL_SHARE"])
@@ -325,22 +345,21 @@ def add_real_share_sampler():
         dataset = self._build_dataset("training")
         sampler = dataset.sampler
         starts = sampler.indices[:: sampler.skip_idx][: len(dataset), 0]  # first buffer step of every training window
-        real = np.asarray(dataset.replay_buffer["domain"])[starts] == 0
-        n_real, n_sim = int(real.sum()), int((~real).sum())
-        if not n_real or not n_sim:
-            raise RuntimeError(f"IWS_REAL_SHARE needs both domains in the training set: {n_real} real, {n_sim} sim windows")
-        weights = np.where(real, share / n_real, (1 - share) / n_sim)
-        print(f"Training samples: real with probability {share} ({n_real} real, {n_sim} sim windows; "
-              f"{100 * n_real / len(real):.1f} % real without it)", flush=True)
+        is_real = np.asarray(dataset.replay_buffer["domain"])[starts] == 0
+        real, sim = np.flatnonzero(is_real), np.flatnonzero(~is_real)
+        if not len(real) or not len(sim):
+            raise RuntimeError(f"IWS_REAL_SHARE needs both domains in the training set: {len(real)} real, {len(sim)} sim")
+        batch_size = self.cfg.training.batch_size
+        print(f"Training batches of {batch_size}: {batch_size * share:g} real samples each on average, the rest sim "
+              f"({len(real)} real, {len(sim)} sim windows; {100 * is_real.mean():.1f} % real without it)", flush=True)
         return torch.utils.data.DataLoader(
             dataset,
-            batch_size=self.cfg.training.batch_size,
+            batch_sampler=mixed_batches(real, sim, batch_size, share, len(dataset) // batch_size),
             num_workers=min(os.cpu_count(), self.cfg.training.data.num_workers),
-            sampler=torch.utils.data.WeightedRandomSampler(torch.as_tensor(weights), len(dataset), replacement=True),
             persistent_workers=False,
             pin_memory=False,
             prefetch_factor=1,
-        )  # IWS's loader, with the sampler in place of shuffle
+        )  # IWS's loader, with the batch sampler in place of shuffle
 
     BaseLightningExperiment._build_training_loader = build_training_loader
 
